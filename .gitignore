@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+
+# Raw files and exports: keep personal photos out of git
+*.SRF
+*.srf
+*.ARW
+*.tif
+*.tiff
+*.TIF
+*.dng
+*.DNG
+*.jpg
+*.JPG
+*.jpeg
+*.jxl
+*.heic
+*.avif
+*.webp
+*.exr
+*.xmp
+
+# Never commit Sony software or shortcuts to it
+*.lnk
+*.dll
+*.exe
+*.iso
+
+# OS / editors
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

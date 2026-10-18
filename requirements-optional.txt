@@ -1,0 +1,6 @@
+# Extra export formats. A missing one only hides its format.
+imagecodecs>=2024.1.1   # JPEG XL, LZW / Zstandard TIFF, 16-bit JPEG 2000, 10/12-bit AVIF
+OpenEXR>=3.2            # OpenEXR
+# pillow-heif adds HEIF / HEIC when running from source. Its binary wheels are GPLv2 (they
+# contain x265), so it is NOT bundled in the release .exe. Install it yourself if you want it:
+#   pip install pillow-heif
