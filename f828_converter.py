@@ -6,9 +6,9 @@
 # support for it is not permitted. Modified versions must link to the official repository above in
 # their documentation.
 """
-Sony DSC-F828 RGBE RAW converter  -  v20
+Sony DSC-F828 RGBE RAW converter  -  v20.1
 
-  pip install -r requirements.txt     (PySide6 numpy scipy rawpy tifffile Pillow)
+  pip install -r requirements.txt     (PySide6 numpy scipy rawpy tifffile Pillow numba)
   (optional)  pip install imagecodecs      -> JPEG XL, LZW / Zstandard TIFF, more JPEG 2000 / AVIF
               pip install pillow-heif      -> HEIF / HEIC (source only: GPL, so not in the .exe)
               pip install OpenEXR          -> OpenEXR
@@ -105,6 +105,15 @@ New in v20:
     removal.
   * The slow tools now run on every core.
 
+New in v20.1:
+
+  * About 4x faster full-size exports with Sony colour, and faster opening and
+    previews, with output identical to v20 bit for bit. IDC's colour processor,
+    its output step and its demosaic are compiled with Numba (optional: without
+    it the same steps run in numpy, slower); black subtraction, curve encoding
+    and the preview's downsizing run on every core. The first launch compiles
+    the fast paths in the background (about 15 s) and keeps them on disk.
+
 Run:   python f828_converter.py            (or pass .SRF files / folders as arguments)
 Build: pyinstaller f828_converter.spec      (one .exe, with the profiles and the codecs installed)
 
@@ -137,6 +146,32 @@ from PIL import features as pil_features
 from scipy.ndimage import (affine_transform, convolve, convolve1d, correlate1d, gaussian_filter,
                            map_coordinates, maximum_filter, median_filter, minimum_filter,
                            uniform_filter)
+
+# Numba (optional) compiles the slow integer steps of IDC's processor and demosaic to
+# machine code. Without it the same steps run in numpy with identical results, only
+# slower. F828_NO_NUMBA=1 turns it off (for comparing the two).
+try:
+    if os.environ.get("F828_NO_NUMBA"):
+        raise ImportError("turned off by F828_NO_NUMBA")
+    import numba
+    HAVE_NUMBA = True
+except Exception:
+    numba = None
+    HAVE_NUMBA = False
+
+
+# The compiled code is cached on disk (beside this file, or for the .exe in the user's
+# cache folder), so only the first run compiles. Only the app itself (this file run as
+# the main program, or the .exe) uses the cache: a cache entry names the module that
+# compiled it, and this file imported or exec'd by a tool or test runs under another
+# name, so it compiles afresh instead of reading entries it could not use.
+_NUMBA_CACHE = __name__ == "__main__"
+
+
+def _kernel(fn):
+    """Compiled with Numba when it is installed (releases the GIL, so the develop threads
+    run in parallel); otherwise the plain function, which is then never called."""
+    return numba.njit(nogil=True, cache=_NUMBA_CACHE)(fn) if HAVE_NUMBA else fn
 from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal, qVersion
 from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QKeySequence,
                          QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap,
@@ -149,7 +184,7 @@ from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QAbstractSpin
                              QToolButton, QVBoxLayout, QWidget)
 
 APP_NAME = "F828 RGBE Converter"
-APP_VERSION = "20"
+APP_VERSION = "20.1"
 SOFTWARE_TAG = f"{APP_NAME} v{APP_VERSION}"
 RAW_EXTENSIONS = (".srf",)
 
@@ -1399,6 +1434,577 @@ def idc_output16(y8, cb8, cr8, p, first):
     return out
 
 
+# ---- the same steps compiled (Numba) ----------------------------------------------
+# Line-for-line translations of idc_colour_stage + _idc_pixels, idc_output16 and the input
+# step of render_sony_exact, run one sensor row at a time so everything stays in the
+# cache. They give the numpy functions' results bit for bit (checked on random inputs
+# and register settings); the numpy functions stay as the reference and the fallback.
+
+_IDC_STAGE_KEYS = ("cap", "clip_en", "clip_thr", "mask0", "mask1", "mask2", "ext_en", "hsel", "lsel",
+                   "ymode", "pivot", "ycon", "yoff", "knee", "knee_s", "posterize", "neg_y", "ymax", "ymin",
+                   "ydel", "cmode", "sup_en", "sup_hi", "sup_hi_sh", "sup_lo", "sup_lo_g", "ck_hi", "ck_lo",
+                   "ck_hi_m", "ck_lo_m", "f2tap", "f121", "f323", "k688", "k689", "k68a", "k68b",
+                   "g68c", "g68d", "g68e", "g68f", "off_cb", "off_cr", "neg_c")
+
+
+def _idc_stage_vector(p):
+    """idc_colour_stage's settings as one integer array for the kernel."""
+    v = [int(x) for row in p["m"] for x in row] + [int(x) for x in p["wb"]] + [int(x) for x in p["lw"]]
+    v += [int(p[k]) for k in _IDC_STAGE_KEYS]
+    return np.array(v, dtype=np.int64)
+
+
+@_kernel
+def _nb_curve(a0, table):
+    neg = a0 < 0
+    a = ((-a0) & 0xfff) if neg else a0
+    s = a >> 8
+    if s == 0:
+        idx = (a >> 3) & 0x1f
+        fr = (a & 7) << 4
+    elif s == 1:
+        idx = ((a & 0xf0) | 0x200) >> 4
+        fr = (a & 0xf) << 3
+    elif s <= 3:
+        idx = ((a & 0x1e0) | 0x600) >> 5
+        fr = (a & 0x1f) << 2
+    elif s <= 7:
+        idx = ((a & 0x3c0) | 0x1000) >> 6
+        fr = (a & 0x3f) << 1
+    else:
+        idx = ((a & 0x780) | 0x2800) >> 7
+        fr = a & 0x7f
+    lo = table[idx]
+    v = ((((table[idx + 1] - lo) * fr) >> 6) + 1 + lo * 2) >> 1
+    if v > 0xfff:
+        v = 0xfff
+    return -v if neg else v
+
+
+@_kernel
+def _nb_lag(a, n, k):
+    return a[n - k] if n >= k else 0
+
+
+@_kernel
+def _nb_knee_hi(v, ck_hi, hm):
+    t = v - ck_hi
+    if t < 1:
+        return t * 2
+    if hm == 1:
+        return t + (t >> 1)
+    if hm == 2:
+        return t
+    if hm == 3:
+        return t >> 1
+    return t * 2
+
+
+@_kernel
+def _nb_half_knee(v, ck_lo, ck_hi, lm, hm):
+    t = v - ck_lo
+    if t < 0:
+        if lm == 0:
+            return (t * 2 + 1 + ck_lo * 2) >> 1
+        if lm == 1:
+            return (t + (t >> 1) + 1 + ck_lo * 2) >> 1
+        if lm == 3:
+            return ((t >> 1) + 1 + ck_lo * 2) >> 1
+        return (t + 1 + ck_lo * 2) >> 1
+    return (_nb_knee_hi(v, ck_hi, hm) + 1 + ck_hi * 2) >> 1
+
+
+@_kernel
+def _nb_chroma_filter(val, kill, supd, f2tap, f121, f323, N, out):
+    v = np.zeros(N, np.int64)
+    for n in range(N):
+        x = val[n - 7] if n >= 7 else 0
+        kl = kill[n]
+        if kl == 1:
+            x = x >> 1
+        elif kl == 2:
+            x = x >> 2
+        if kl == 3:
+            x = 0
+        elif x >= 0x800:
+            x = 0x7ff
+        elif x < -0x800:
+            x = -0x800
+        v[n] = x
+    v2 = np.zeros(N, np.int64)
+    for n in range(N):
+        prev = v[n - 1] if n >= 1 else 0
+        v2[n] = (v[n] if f2tap else prev) + prev
+    tq = np.zeros(N, np.int64)
+    for n in range(N):
+        if f121:
+            tq[n] = _nb_lag(v2, n, 2) + _nb_lag(v2, n, 1) * 2 + v2[n]
+        else:
+            tq[n] = _nb_lag(v2, n, 1) * 4
+    for n in range(N):
+        if f323:
+            q = ((tq[n] + _nb_lag(tq, n, 2)) * 3 + _nb_lag(tq, n, 1) * 2) >> 3
+        else:
+            q = _nb_lag(tq, n, 1)
+        out[n] = (((q * supd[n]) >> 10) + 1) >> 1
+
+
+@_kernel
+def _nb_stage_row(r, g, b, e, hrow, krow, has_h, has_k, pv, curve, curve_d, lut, phase, N):
+    """One row of idc_colour_stage: stream arrays of length N -> (Y8, C8) per stream step."""
+    m = pv[0:12]
+    wb = pv[12:15]
+    lw0, lw1, lw2 = pv[15], pv[16], pv[17]
+    q = pv[18:]
+    cap, clip_en, clip_thr, mask0, mask1, mask2, ext_en = q[0], q[1], q[2], q[3], q[4], q[5], q[6]
+    hsel, lsel, ymode, pivot, ycon, yoff, knee, knee_s = q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14]
+    posterize, neg_y, ymax, ymin, ydel, cmode = q[15], q[16], q[17], q[18], q[19], q[20]
+    sup_en, sup_hi, sup_hi_sh, sup_lo, sup_lo_g = q[21], q[22], q[23], q[24], q[25]
+    ck_hi, ck_lo, hm, lm, f2tap, f121, f323 = q[26], q[27], q[28], q[29], q[30], q[31], q[32]
+    k688, k689, k68a, k68b, g68c, g68d, g68e, g68f = q[33], q[34], q[35], q[36], q[37], q[38], q[39], q[40]
+    off_cb, off_cr, neg_c = q[41], q[42], q[43]
+
+    Rc = np.empty(N, np.int64)
+    Gc = np.empty(N, np.int64)
+    Bc = np.empty(N, np.int64)
+    y = np.empty(N, np.int64)
+    kill = np.zeros(N, np.int64)
+    flag = np.zeros(N, np.bool_)
+    for n in range(N):
+        rr, gg, bb, ee = r[n], g[n], b[n], e[n]
+        for c in range(3):
+            v = (((m[4 * c] * rr) >> 7) + ((m[4 * c + 1] * gg) >> 7) + ((m[4 * c + 2] * bb) >> 7)
+                 + ((m[4 * c + 3] * ee) >> 7) + 4) >> 3
+            v = min(max(v, -0x800), 0xffc)
+            v = (wb[c] * v + 0x80) >> 8
+            v = min(max(v, -0x800), 0xffc)
+            v = min(v, cap)
+            cv = _nb_curve(v, curve)
+            if c == 0:
+                Rc[n] = cv
+            elif c == 1:
+                Gc[n] = cv
+            else:
+                Bc[n] = cv
+        if clip_en:
+            flag[n] = (max(rr >> 2, 0) > clip_thr or max(gg >> 2, 0) > clip_thr
+                       or max(bb >> 2, 0) > clip_thr or max(ee >> 2, 0) > clip_thr)
+        # luma with the detail LUT(high) - LUT(low)
+        if hsel == 1:
+            hv = hrow[n] if has_h else (gg + ee + 1) >> 1
+        elif hsel == 5:
+            hv = rr
+        elif hsel == 6:
+            hv = gg
+        elif hsel == 7:
+            hv = bb
+        else:
+            hv = 0
+        if lsel == 4 or lsel == 6:
+            lv = (ee + 1 + gg) >> 1
+        elif lsel == 5:
+            lv = rr
+        elif lsel == 7:
+            lv = bb
+        elif lsel == 1:
+            lv = ((((ee + bb + gg + rr) >> 1) & 0x3fff) + 1) >> 1
+        else:
+            lv = 0
+        hc = _nb_curve(hv, curve_d)
+        lc = _nb_curve(lv, curve_d)
+        yy = (((((lw2 * Bc[n]) >> 3) + ((lw1 * Gc[n]) >> 3) + ((lw0 * Rc[n]) >> 3)) >> 2) + 1) >> 1
+        yy = 0x7ff if yy >= 0x7ff else max(yy, -0x800)
+        if ymode == 1:
+            yy = yy - lc + hc
+            yy = 0x7ff if yy >= 0x7ff else (-0x800 if yy < -0x7ff else yy)
+        elif ymode == 2:
+            yy = hc
+        elif ymode == 3:
+            yy = lc
+        elif ymode != 0:
+            yy = 0
+        y[n] = yy
+    if clip_en:
+        for n in range(N):
+            kidx = 0
+            for bit in range(3):
+                mask = mask0 if bit == 0 else (mask1 if bit == 1 else mask2)
+                hit = False
+                for k in range(32):
+                    if (mask >> k) & 1 and n >= k and flag[n - k]:
+                        hit = True
+                        break
+                if hit:
+                    kidx += 1 << bit
+            kill[n] = (0, 1, 2, 2, 3, 3, 3, 3)[kidx]
+    if ext_en and has_k:
+        for n in range(N):
+            kv = krow[n - 7] if n >= 7 else 0
+            if kv > kill[n]:
+                kill[n] = kv
+
+    Y8 = np.zeros(N, np.uint8)
+    yl = 10 + ydel
+    for n in range(yl, N):
+        yd = y[n - yl - 1] if n - yl >= 1 else 0
+        yv = 0x7ff if yd >= 0x7ff else max(yd, -0x800)
+        ya = min(abs(yv), 0x4f0)
+        k = ya >> 4
+        lo = lut[k]
+        yo = ((((lut[k + 1] - lo) * (ya & 0xf)) >> 3) + 1 + lo * 2) >> 1
+        if yo > 0x7fe:
+            yo = 0x7ff
+        if yv < 0:
+            yo = -yo
+        u = yo - pivot * 4
+        if u < -0x800:
+            u = u & 0xfff
+        u = (((ycon * u) >> 6) + 1 + (yoff + pivot) * 8) >> 1
+        u = 0x7ff if u >= 0x7ff else (0 if u < 1 else u)
+        t = u - knee
+        t = t * 16 if t < 0 else (16 - knee_s) * t
+        u = (((t >> 3) + 1) >> 1) + knee
+        u = 0x3fc if u >= 0x3fd else (0 if u < 0 else u)
+        if posterize == 1:
+            u = u & ~0x7f
+        if neg_y == 1:
+            u = u ^ 0x3ff
+        u = ymax if u >= ymax else (ymin if u <= ymin else u)
+        Y8[n] = min(((u >> 1) + 1) >> 1, 0xff)
+
+    # chroma suppression from the [1 3 3 1] / 2 luma
+    a = np.empty(N, np.int64)
+    for n in range(N):
+        yprev = y[n - 1] if n >= 1 else 0
+        a[n] = (yprev if cmode == 3 else y[n]) + yprev
+    supd = np.zeros(N, np.int64)
+    for n in range(7, N):
+        j = n - 7
+        ysup = (_nb_lag(a, j, 3) + _nb_lag(a, j, 2) * 2 + 1 + _nb_lag(a, j, 1)) >> 1
+        if not sup_en:
+            s = 0xff
+        else:
+            hi = max(ysup - sup_hi, 0)
+            if 1 <= sup_hi_sh <= 6:
+                hi = hi >> (7 - sup_hi_sh)
+            elif sup_hi_sh != 7:
+                hi = 0
+            s1 = min(max(0xff - hi, 0), 0xff)
+            s2 = min(max(0xff - ((max(sup_lo - ysup, 0) * sup_lo_g) >> 3), 0), 0xff)
+            s = min(s1, s2)
+        supd[n] = s
+
+    dr_in = np.empty(N, np.int64)
+    db_in = np.empty(N, np.int64)
+    for n in range(N):
+        l18 = _nb_half_knee(Bc[n], ck_lo, ck_hi, lm, hm)
+        g17 = _nb_half_knee(Gc[n], ck_lo, ck_hi, lm, hm)
+        t = Rc[n] - ck_lo
+        if t < 0:
+            if lm == 0:
+                ralt = t * 2
+            elif lm == 1:
+                ralt = t + (t >> 1)
+            elif lm == 3:
+                ralt = t >> 1
+            else:
+                ralt = t
+            r16 = ralt + 1 + ck_lo * 2
+        else:
+            r16 = _nb_knee_hi(Rc[n], ck_hi, hm) + 1 + ck_hi * 2
+        dr_in[n] = (r16 >> 1) - g17
+        db_in[n] = l18 - g17
+    drf = np.empty(N, np.int64)
+    dbf = np.empty(N, np.int64)
+    _nb_chroma_filter(dr_in, kill, supd, f2tap, f121, f323, N, drf)
+    _nb_chroma_filter(db_in, kill, supd, f2tap, f121, f323, N, dbf)
+
+    iv2 = np.empty(N, np.int64)
+    xc = np.empty(N, np.int64)
+    for n in range(N):
+        ph0 = ((n + phase) & 1) == 0
+        iv = _nb_lag(dbf, n, 2) if ph0 else _nb_lag(drf, n, 1)
+        iv2[n] = iv
+        neg = iv < 0
+        if ph0:
+            coef = k68a if neg else k688
+        else:
+            coef = k68b if neg else k689
+        xc[n] = min(max((coef * iv) >> 6, -0x1000), 0xfff)
+    C8 = np.empty(N, np.uint8)
+    for n in range(N):
+        ph0 = ((n + phase) & 1) == 0
+        xd = _nb_lag(xc, n, 2)
+        tt = (xd + 1 + (_nb_lag(iv2, n, 3) if ph0 else _nb_lag(iv2, n, 1)) * 2) >> 1
+        tn = tt < 0
+        if ph0:
+            gg2 = g68f if tn else g68d
+        else:
+            gg2 = g68e if tn else g68c
+        c = ((((gg2 * tt) >> 6) + 1) >> 1) + (off_cr if ph0 else off_cb) * 4
+        c = 0x1fc if c >= 0x1fc else (-0x1fc if c < -0x1fb else c)
+        c8 = ((((c >> 1) + 1) ^ -0xff) >> 1) & 0xff
+        if neg_c == 1:
+            c8 = c8 ^ 0xff
+        C8[n] = c8
+    return Y8, C8
+
+
+@_kernel
+def _nb_stage_pixels(xi, H, K, has_h, has_k, pv, curve, curve_d, lut, preroll, luma_delay, y8, cb8, cr8):
+    """Rows of int R G B E (rows, W, 4) -> per-pixel Y8, Cb8, Cr8 (as idc_colour_stage + _idc_pixels,
+    phase 1). Returns the parity of the columns that start a 4:2:2 pair."""
+    rows, W = xi.shape[0], xi.shape[1]
+    N = W + preroll + 16
+    r = np.empty(N, np.int64)
+    g = np.empty(N, np.int64)
+    b = np.empty(N, np.int64)
+    e = np.empty(N, np.int64)
+    hr = np.zeros(N, np.int64)
+    kr = np.zeros(N, np.int64)
+    n0 = preroll + luma_delay
+    first = 0
+    for x in range(W):
+        if ((x + n0 + 1) & 1) == 1:
+            first = x % 2
+            break
+    for i in range(rows):
+        for n in range(N):
+            x = min(max(n - preroll, 0), W - 1)
+            r[n] = xi[i, x, 0]
+            g[n] = xi[i, x, 1]
+            b[n] = xi[i, x, 2]
+            e[n] = xi[i, x, 3]
+            if has_h:
+                hr[n] = H[i, x]
+            if has_k:
+                kr[n] = K[i, x]
+        Y8, C8 = _nb_stage_row(r, g, b, e, hr, kr, has_h, has_k, pv, curve, curve_d, lut, 1, N)
+        for x in range(W):
+            nn = x + n0
+            ncb = nn if ((nn + 1) & 1) == 1 else nn - 1
+            y8[i, x] = Y8[nn]
+            cb8[i, x] = C8[ncb]
+            cr8[i, x] = C8[ncb + 1]
+    return first
+
+
+_IDC_POST_KEYS = ("c_neg", "c_fix", "c_fix_cb", "c_fix_cr", "c_thr_cb", "c_thr_cr", "c_pass", "c_qmask",
+                  "y_post", "y_neg", "s_lev_hi", "s_en", "s_pair_off", "s_alt", "s_w0", "s_w", "s_fixed",
+                  "s_adapt", "s_adapt_sh", "s_pattern")
+
+
+def _idc_post_vector(p):
+    """idc_output16's settings as one integer array for the kernel."""
+    v = [int(p[k]) for k in _IDC_POST_KEYS]
+    v += [int(x) for x in p["c_cen_cb"]] + [int(x) for x in p["c_cen_cr"]] + [int(x) for x in p["c_scale"]]
+    return np.array(v, dtype=np.int64)
+
+
+@_kernel
+def _nb_abs1(t):
+    return -t - 1 if t < 0 else t
+
+
+@_kernel
+def _nb_output16(y8, cb8, cr8, pv, first, recip, out):
+    """idc_output16 -> out (rows, W, 3) uint16."""
+    c_neg, c_fix, c_fix_cb, c_fix_cr, c_thr_cb, c_thr_cr = pv[0], pv[1], pv[2], pv[3], pv[4], pv[5]
+    c_qmask, y_post, y_neg = pv[7], pv[8], pv[9]
+    s_en, s_pair_off, s_alt, s_w0, s_w, s_fixed, s_adapt, s_adapt_sh, s_pattern = (
+        pv[11], pv[12], pv[13], pv[14], pv[15], pv[16], pv[17], pv[18], pv[19])
+    cen_cb = pv[20:24]
+    cen_cr = pv[24:28]
+    cscale = pv[28:32]
+    rows, W = y8.shape
+    J = (W - 1 + first) // 2 + 1
+    lp = np.empty((rows, J), np.int64)
+    for i in range(rows):
+        for j in range(J):
+            x = max(2 * j - first, 0)
+            cb = c_fix_cb if c_fix == 1 else np.int64(cb8[i, x])
+            cr = c_fix_cr if c_fix == 1 else np.int64(cr8[i, x])
+            if c_neg == 1:
+                cb, cr = cb ^ 0xff, cr ^ 0xff
+            u0, v0 = cb - 0x80, cr - 0x80
+            q = (1 if u0 < c_thr_cb else 0) + (2 if v0 < c_thr_cr else 0)
+            u = u0 - cen_cb[q]
+            v = v0 - cen_cr[q]
+            au, av = _nb_abs1(u), _nb_abs1(v)
+            s = (((_nb_abs1(au - 2 * av) + _nb_abs1(2 * au - av) + ((_nb_abs1(au - av) * 3) >> 1)) >> 2) + 1) >> 1
+            dd = (cscale[q] * (av + s + au)) >> 5
+            lev = 0 if dd >= 64 else (1 if dd >= 32 else (2 if dd >= 16 else 3))
+            if ((c_qmask >> q) & 1) != 1:
+                lev = 0
+            lp[i, j] = lev
+    acc = np.empty((rows, J), np.int64)
+    for i in range(rows):
+        for j in range(J):
+            t = 0
+            for d in range(-2, 3):
+                t += lp[min(max(i + d, 0), rows - 1), j]
+            acc[i, j] = t
+    four = (0, 1, 0, 1, 1, 0, 1, 0)
+    nb = np.empty(8, np.int64)
+    f = np.empty(8, np.bool_)
+    for i in range(rows):
+        iu, idn = max(i - 1, 0), min(i + 1, rows - 1)
+        for x in range(W):
+            xl, xr = max(x - 1, 0), min(x + 1, W - 1)
+            y = np.int64(y8[i, x])
+            if y_post == 1:
+                y = y & 0xe0
+            if y_neg == 1:
+                y = y ^ 0xff
+            for k in range(8):
+                ii = iu if k < 3 else (i if k < 5 else idn)
+                xx = (xl, x, xr, xl, xr, xl, x, xr)[k]
+                v = np.int64(y8[ii, xx])
+                if y_post == 1:
+                    v = v & 0xe0
+                if y_neg == 1:
+                    v = v ^ 0xff
+                nb[k] = v
+            count = 0
+            for k in range(8):
+                f[k] = y == nb[k]
+                count += 1 if f[k] else 0
+            if not s_en:
+                for k in range(8):
+                    f[k] = False
+            elif s_fixed == 1:
+                for k in range(8):
+                    f[k] = ((s_pattern >> k) & 1) == 1
+            elif s_pair_off != 0 or s_alt != 0:
+                b10 = s_pair_off == 0
+                enter = (s_alt & (1 if (count != 0 and b10) else 0)) == 0
+                inner = (s_alt & (1 if count == 0 else 0)) == 0
+                p0, p1, p2, p3 = f[0] and f[7], f[1] and f[6], f[2] and f[5], f[3] and f[4]
+                if enter and inner:
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7] = p0, p1, p2, p3, p3, p2, p1, p0
+                elif enter:
+                    for k in range(8):
+                        f[k] = four[k] == 1
+            qi = (x + first) // 2
+            if s_adapt:
+                S = acc[i, max(qi - 1, 0)] + acc[i, qi] + acc[i, min(qi + 1, J - 1)]
+                adapt = max(s_w - ((S & 0xff) >> ((4 - s_adapt_sh) & 0x1f)), 1)
+            else:
+                adapt = s_w
+            if s_en == 1 and s_alt == 1:
+                wgt = s_w0 if count == 0 else adapt
+            else:
+                wgt = adapt
+            tot = y * wgt
+            n = wgt
+            for k in range(8):
+                if f[k]:
+                    tot += nb[k]
+                    n += 1
+            y16 = (tot * recip[min(n, 63)]) >> 5
+            y16 = min(max(y16, 0), 0xffff)
+            y16 -= y16 >> 9
+            y16 <<= 10
+            cb = c_fix_cb if c_fix == 1 else np.int64(cb8[i, x])
+            cr = c_fix_cr if c_fix == 1 else np.int64(cr8[i, x])
+            if c_neg == 1:
+                cb, cr = cb ^ 0xff, cr ^ 0xff
+            cb16 = cb * 256 - (cb >> 1) - 0x8000
+            cr16 = cr * 256 - (cr >> 1) - 0x8000
+            for k in range(3):
+                if k == 0:
+                    v = (cr16 * 0x59c + y16) >> 10
+                elif k == 1:
+                    v = (cb16 * -0x160 + cr16 * -0x2db + y16) >> 10
+                else:
+                    v = (cb16 * 0x717 + y16) >> 10
+                out[i, x, k] = 0 if v < 1 else min(v, 0xffff)
+
+
+@_kernel
+def _nb_exact_input(src, scale, gain, use_gain, det, has_det, kill, has_kill, xi, H, K):
+    """render_sony_exact's integer inputs from rows of un-balanced RGBE (any float32 array with
+    4+ planes): xi = rint(clip(src * scale [* gain])), H = rint(clip(detail + (G + E) / 2)), K."""
+    rows, W = src.shape[0], src.shape[1]
+    lo, hi = np.float32(-8192.0), np.float32(65535.0)
+    half = np.float32(0.5)
+    for i in range(rows):
+        for x in range(W):
+            xg = np.float32(0.0)
+            xe = np.float32(0.0)
+            for c in range(4):
+                v = np.float32(src[i, x, c] * scale[c])
+                if use_gain:
+                    v = np.float32(v * gain)
+                v = min(max(v, lo), hi)
+                if c == 1:
+                    xg = v
+                elif c == 3:
+                    xe = v
+                xi[i, x, c] = np.int32(np.rint(v))
+            if has_det:
+                d = det[i, x]
+                if use_gain:
+                    d = np.float32(d * gain)
+                hv = np.float32(d + np.float32(half * np.float32(xg + xe)))
+                H[i, x] = np.int32(np.rint(min(max(hv, lo), hi)))
+            if has_kill:
+                k = kill[i, x]
+                K[i, x] = 0 if k >= 0.75 else (1 if k >= 0.375 else (2 if k >= 0.125 else 3))
+
+
+
+_SRGB16_LINEAR = None
+
+
+def srgb16_linear():
+    """srgb_decode of every 16-bit code, as a lookup table (the same numbers, computed once)."""
+    global _SRGB16_LINEAR
+    if _SRGB16_LINEAR is None:
+        _SRGB16_LINEAR = srgb_decode(np.arange(65536, dtype=np.float32) * np.float32(1.0 / 65535.0))
+    return _SRGB16_LINEAR
+
+
+def _idc_render16_fast(src, scale, gain, detail, kill, cam, p):
+    """The compiled render_sony_exact, up to IDC's 16-bit RGB: src (rows, W, 4+) un-balanced
+    RGBE, times `scale` and, if `gain` is not None, `gain` (and so is `detail`)."""
+    rows, W = src.shape[:2]
+    xi = np.empty((rows, W, 4), np.int32)
+    has_h, has_k = detail is not None, kill is not None
+    H = np.empty((rows, W) if has_h else (1, 1), np.int32)
+    K = np.empty((rows, W) if has_k else (1, 1), np.int32)
+    dummy = np.zeros((1, 1), np.float32)
+    _nb_exact_input(src, np.asarray(scale, np.float32), np.float32(1.0 if gain is None else gain), gain is not None,
+                    detail if has_h else dummy, has_h, kill if has_k else dummy, has_k, xi, H, K)
+    y8 = np.empty((rows, W), np.uint8)
+    cb8 = np.empty_like(y8)
+    cr8 = np.empty_like(y8)
+    curve = np.asarray(list(p["curve"]) + [p["curve"][-1]] * 32, dtype=np.int64)
+    curve_d = np.asarray(list(p["curve_d"]) + [p["curve_d"][-1]] * 32, dtype=np.int64)
+    lut = np.asarray([0] + list(p["lut_y"])[:80], dtype=np.int64)
+    first = _nb_stage_pixels(xi, H, K, has_h, has_k, _idc_stage_vector(p), curve, curve_d, lut,
+                             IDC_PREROLL, IDC_LUMA_DELAY, y8, cb8, cr8)
+    del xi, H, K
+    out = np.empty((rows, W, 3), np.uint16)
+    _nb_output16(y8, cb8, cr8, _idc_post_vector(cam["post"]), first, _IDC_RECIP.astype(np.int64), out)
+    return out
+
+
+def render_sony_exact_rows(src, scale, gain, detail, kill, cam, wb_post, mode="real", context=(0, 0),
+                           exposure=0.0):
+    """render_sony_exact straight from frame rows (compiled; needs HAVE_NUMBA): `src` holds
+    un-balanced RGBE in its first four planes, which become the processor's input as
+    src * scale (* gain when `gain` is not None, the exposure; `detail` gets it too)."""
+    if cam.get("stage") is None:
+        raise ValueError("no colour-stage registers")
+    p = _idc_stage_params(cam, wb_post, mode, exposure)
+    rgb16 = _idc_render16_fast(src, scale, gain, detail, kill, cam, p)
+    t, b = context
+    if t or b:
+        rgb16 = rgb16[t:rgb16.shape[0] - b]
+    return srgb16_linear()[rgb16]
+
+
 def render_sony_exact(raw12, cam, wb_post, mode="real", detail=None, kill=None, context=(0, 0),
                       exposure=0.0):
     """render_sony_dsp in IDC's own arithmetic, with its 4:2:2 chroma and output filters:
@@ -1408,6 +2014,11 @@ def render_sony_exact(raw12, cam, wb_post, mode="real", detail=None, kill=None, 
     is enough); they are not returned. detail / kill / exposure: as render_sony_dsp."""
     if cam.get("stage") is None:
         raise ValueError("no colour-stage registers")
+    if HAVE_NUMBA and all(a is None or np.asarray(a).dtype == np.float32 for a in (raw12, detail, kill)):
+        return render_sony_exact_rows(np.asarray(raw12), np.ones(4, np.float32), None,
+                                      None if detail is None else np.asarray(detail),
+                                      None if kill is None else np.asarray(kill),
+                                      cam, wb_post, mode, context, exposure)
     p = _idc_stage_params(cam, wb_post, mode, exposure)
     x = np.clip(raw12, -8192.0, 65535.0)
     xi = np.rint(x).astype(np.int32)
@@ -1425,7 +2036,7 @@ def render_sony_exact(raw12, cam, wb_post, mode="real", detail=None, kill=None, 
     t, b = context
     if t or b:
         rgb16 = rgb16[t:rgb16.shape[0] - b]
-    return srgb_decode(rgb16.astype(np.float32) * np.float32(1.0 / 65535.0))
+    return srgb16_linear()[rgb16]
 
 
 def srgb_to_rgb(space):
@@ -1652,7 +2263,16 @@ def cfa_to_superpixel(cfa, cmap):
 def block_mean(img, k):
     h, w, c = img.shape
     h, w = h - h % k, w - w % k
-    return img[:h, :w].reshape(h // k, k, w // k, k, c).mean(axis=(1, 3))
+    if h * w < 1 << 20:
+        return img[:h, :w].reshape(h // k, k, w // k, k, c).mean(axis=(1, 3))
+
+    # Large frames in strips of output rows on the develop threads; numpy averages each
+    # block in the same order whatever the strip, so the result is the same to the bit.
+    def part(a, b, out):
+        out[a:b] = img[a * k:b * k, :w].reshape(b - a, k, w // k, k, c).mean(axis=(1, 3))
+
+    dtype = np.mean(img[:k, :k], axis=(0, 1)).dtype
+    return _in_strips(part, (h // k, w // k, c), dtype, strip=64)
 
 
 def demosaic_bilinear(cfa, cmap):
@@ -1854,6 +2474,135 @@ def _idc_kill(v, ge, threshold):
     return IDC_KILL_SCALE[np.maximum(3 * flag, np.maximum(2 * n1, n2))]
 
 
+# Compiled forms of the steps above (identical results; see the colour stage's).
+
+@_kernel
+def _nb_mirror(i, n):
+    if i < 0:
+        i = -i
+    if i > n - 1:
+        i = 2 * (n - 1) - i
+    return i
+
+
+@_kernel
+def _nb_idc_input(cfa, cmap, black, k, v, lo, hi):
+    h, w = cfa.shape
+    for i in range(h):
+        for j in range(w):
+            c = cmap[i, j]
+            x = np.float32(np.float32(cfa[i, j] - black[c]) * k[c])
+            v[i, j] = min(max(x, lo), hi)
+
+
+@_kernel
+def _nb_interp_rows(sub, o, n, ta, tb, out):
+    L, W = sub.shape
+    for i in range(n):
+        q = (i - o) % 2
+        m = (i - o - q) // 2
+        if q == 0:
+            j = min(max(m, 0), L - 1)
+            t = ta
+        else:
+            j = min(max(m + 1, 0), L - 1)
+            t = tb
+        r0, r1, r2, r3, r4 = (_nb_mirror(j - 2, L), _nb_mirror(j - 1, L), j, _nb_mirror(j + 1, L),
+                              _nb_mirror(j + 2, L))
+        for x in range(W):
+            out[i, x] = np.float32(t[0] * np.float64(sub[r0, x]) + t[1] * np.float64(sub[r1, x])
+                                   + t[2] * np.float64(sub[r2, x]) + t[3] * np.float64(sub[r3, x])
+                                   + t[4] * np.float64(sub[r4, x]))
+
+
+@_kernel
+def _nb_idc_colour(v, oy, ox, ta, tb, kc, bc, lo, hi, out, c, full):
+    """IDC's interpolation of one colour lattice to every cell centre: writes plane c of
+    `out` in DN and the 12-bit plane to `full`."""
+    h, w = v.shape
+    sub = v[oy::2, ox::2]
+    tmp = np.empty((h, sub.shape[1]), np.float32)
+    _nb_interp_rows(sub, oy, h, ta, tb, tmp)
+    L = tmp.shape[1]
+    cols = np.empty((w, 5), np.int64)
+    sel = np.empty(w, np.bool_)
+    for j in range(w):
+        q = (j - ox) % 2
+        m = (j - ox - q) // 2
+        jj = min(max(m if q == 0 else m + 1, 0), L - 1)
+        sel[j] = q == 0
+        for d in range(5):
+            cols[j, d] = _nb_mirror(jj + d - 2, L)
+    for i in range(h):
+        for j in range(w):
+            t = ta if sel[j] else tb
+            x = np.float32(t[0] * np.float64(tmp[i, cols[j, 0]]) + t[1] * np.float64(tmp[i, cols[j, 1]])
+                           + t[2] * np.float64(tmp[i, cols[j, 2]]) + t[3] * np.float64(tmp[i, cols[j, 3]])
+                           + t[4] * np.float64(tmp[i, cols[j, 4]]))
+            x = min(max(x, lo), hi)
+            full[i, j] = x
+            out[i, j, c] = np.float32(x / kc) + bc
+
+
+@_kernel
+def _nb_idc_kill(v, cmap, threshold, scale, out, plane):
+    """_idc_kill -> plane `plane` of out. Returns whether any pixel was flagged."""
+    h, w = v.shape
+    f = np.empty((h, w), np.float32)
+    q75, q25 = np.float32(0.75), np.float32(0.25)
+    for i in range(h):
+        for j in range(w):
+            c = cmap[i, j]
+            if c == 1 or c == 3:
+                near, far = v[i, j], v[_nb_mirror(i + 2, h), j]
+            else:
+                near, far = v[_nb_mirror(i + 1, h), j], v[_nb_mirror(i - 1, h), j]
+            f[i, j] = np.float32(q75 * near) + np.float32(q25 * far)
+    flag = np.zeros((h, w), np.uint8)
+    anyf = False
+    for i in range(h):
+        for j in range(w):
+            a = np.float32(f[i, j] - f[i, _nb_mirror(j + 2, w)]) * np.float32(0.5)
+            if abs(np.floor(np.float32(a / np.float32(8.0)))) > threshold:
+                flag[i, j] = 1
+                anyf = True
+    for i in range(h):
+        for j in range(w):
+            if not anyf:
+                out[i, j, plane] = 1.0
+                continue
+            n1 = 0
+            if j >= 1:
+                n1 = max(n1, flag[i, j - 1])
+            if j + 1 < w:
+                n1 = max(n1, flag[i, j + 1])
+            n2 = 0
+            if j >= 2:
+                n2 = max(n2, flag[i, j - 2])
+            if j + 2 < w:
+                n2 = max(n2, flag[i, j + 2])
+            out[i, j, plane] = scale[max(3 * flag[i, j], max(2 * n1, n2))]
+    return anyf
+
+
+@_kernel
+def _nb_idc_detail(v, cmap, G, E, lo, hi, out, plane):
+    """_idc_yhigh minus (G + E) / 2 -> plane `plane` of out."""
+    h, w = v.shape
+    five, eighth, half = np.float32(5.0), np.float32(0.125), np.float32(0.5)
+    for i in range(h):
+        im1, i1, i2 = _nb_mirror(i - 1, h), _nb_mirror(i + 1, h), _nb_mirror(i + 2, h)
+        for j in range(w):
+            c = cmap[i, j]
+            if c == 1 or c == 3:
+                y = np.float32(np.float32(five * np.float32(v[i, j] + v[i1, _nb_mirror(j + 1, w)]))
+                               - v[im1, _nb_mirror(j - 1, w)]) - v[i2, _nb_mirror(j + 2, w)]
+            else:
+                y = np.float32(np.float32(five * np.float32(v[i, _nb_mirror(j + 1, w)] + v[i1, j]))
+                               - v[im1, _nb_mirror(j + 2, w)]) - v[i2, _nb_mirror(j - 1, w)]
+            y = np.float32(y * eighth)
+            y = min(max(y, lo), hi)
+            out[i, j, plane] = y - np.float32(half * np.float32(G[i, j] + E[i, j]))
 def demosaic_idc_frame(cfa, sensor):
     """IDC's demosaic of a mosaic (DN, black not subtracted) -> (h, w, 6) frame:
     R G B E in DN (black not subtracted), IDC's luminance detail in 12-bit units,
@@ -1865,6 +2614,8 @@ def demosaic_idc_frame(cfa, sensor):
     h, w = cfa.shape
     black = cam["black"]
     k = (np.float32(DSP_INPUT_SCALE * cam["gain"]) * cam["pregain"]).astype(np.float32)
+    if HAVE_NUMBA:
+        return _demosaic_idc_fast(np.asarray(cfa, np.float32), cmap, np.asarray(black, np.float32), k, st)
     v = (cfa - black[cmap]) * k[cmap]                     # the processor's 12-bit numbers
     np.clip(v, IDC_V12_MIN, IDC_V12_MAX, out=v)
     where = {int(cmap[dy, dx]): (dy, dx) for dy in (0, 1) for dx in (0, 1)}
@@ -1892,6 +2643,80 @@ def demosaic_idc_frame(cfa, sensor):
     del planes
     out[..., 5] = kill.result() if kill is not None else 1.0
     return out
+
+
+def _demosaic_idc_fast(cfa, cmap, black, k, st):
+    """demosaic_idc_frame with the compiled steps, the colours and the kill on the develop threads."""
+    h, w = cfa.shape
+    lo, hi = np.float32(IDC_V12_MIN), np.float32(IDC_V12_MAX)
+    v = np.empty((h, w), np.float32)
+    _nb_idc_input(cfa, cmap, black, k, v, lo, hi)
+    where = {int(cmap[dy, dx]): (dy, dx) for dy in (0, 1) for dx in (0, 1)}
+    out = np.empty((h, w, IDC_PLANES), dtype=np.float32)
+    ta, tb = IDC_TAPS_A.astype(np.float64), IDC_TAPS_B.astype(np.float64)
+
+    def colour(c):
+        oy, ox = where[c]
+        full = np.empty((h, w), np.float32)
+        _nb_idc_colour(v, oy, ox, ta, tb, k[c], black[c], lo, hi, out, c, full)
+        return full if c in (1, 3) else None
+
+    pool = _develop_pool()
+    jobs = [pool.submit(colour, c) for c in range(4)]
+    kill = (pool.submit(_nb_idc_kill, v, cmap, int(st["kill_threshold"]), IDC_KILL_SCALE, out, 5)
+            if st["kill"] else None)
+    planes = [j.result() for j in jobs]
+    if st["luma_detail"]:
+        _nb_idc_detail(v, cmap, planes[1], planes[3], lo, hi, out, 4)
+    else:
+        out[..., 4] = 0.0
+    if kill is None:
+        out[..., 5] = 1.0
+    else:
+        kill.result()
+    return out
+
+
+def warm_up_kernels():
+    """Compile (or load from the cache) every Numba kernel with the argument types the
+    develop code passes, on tiny arrays, so the first export does not wait for it. Run
+    on a background thread at start-up; harmless to call again."""
+    if not HAVE_NUMBA:
+        return
+    h, w = 12, 16
+    cmap = np.zeros((h, w), np.uint8)
+    cmap[0::2, 1::2], cmap[1::2, 0::2], cmap[1::2, 1::2] = 1, 3, 2
+    cfa = np.full((h, w), 600.0, np.float32)
+    k4, b4 = np.full(4, 0.25, np.float32), np.zeros(4, np.float32)
+    st = {"kill": True, "kill_threshold": 159, "luma_detail": True}
+    frame = _demosaic_idc_fast(cfa, cmap, b4, k4, st)
+    st.update(kill=False, luma_detail=False)
+    _demosaic_idc_fast(cfa, cmap, b4, k4, st)
+    flat = [0] + [8 * i for i in range(1, 97)]
+    p = {"m": [[1024, 0, 0, 0], [0, 1024, 0, 0], [0, 0, 1024, 0]], "wb": (256, 256, 256), "lw": (19, 38, 7),
+         "curve": flat, "curve_d": flat, "lut_y": list(IDC_LUT_Y_IDENTITY), "mask0": 0x80, "mask1": 0x80, "mask2": 0x80}
+    p.update({key: 0 for key in _IDC_STAGE_KEYS if key not in p})
+    post = {key: 0 for key in _IDC_POST_KEYS}
+    post.update(c_cen_cb=(0, 0, 0, 0), c_cen_cr=(0, 0, 0, 0), c_scale=(0, 0, 0, 0))
+    cam = {"post": post}
+    rows = frame[2:10]
+    for gain in (None, np.float32(1.5)):
+        _idc_render16_fast(rows, k4, gain, rows[..., 4], rows[..., 5], cam, p)
+        _idc_render16_fast(frame[2:10, :, :4], k4, gain, None, None, cam, p)
+    _idc_render16_fast(np.ascontiguousarray(rows[..., :4]), np.ones(4, np.float32), None,
+                       np.ascontiguousarray(rows[..., 4]), np.ascontiguousarray(rows[..., 5]), cam, p)
+
+
+def _warm_up_or_fall_back():
+    """warm_up_kernels; if Numba cannot compile on this machine, use the numpy steps instead
+    (identical results, slower) rather than fail later in an export."""
+    global HAVE_NUMBA
+    try:
+        warm_up_kernels()
+    except Exception:
+        HAVE_NUMBA = False
+        sys.stderr.write("Numba could not compile the fast paths; using numpy instead.\n"
+                         + traceback.format_exc())
 
 
 def idc_detail_factor(part, scale12):
@@ -2161,11 +2986,32 @@ def normalise_rgbe(dn, black, white):
     """Black-subtracted, normalised 4-channel image. No lower clip anywhere.
     Planes after the fourth (IDC's demosaic) are passed through unchanged."""
     black = np.asarray(black, dtype=np.float32)
+    if dn.dtype == np.float32 and dn.ndim == 3 and dn.shape[0] * dn.shape[1] >= 1 << 20:
+        return _in_strips(lambda a, b, o: _normalise_part(dn[a:b], black, white, o[a:b]), dn.shape, np.float32)
     if dn.shape[-1] == 4:
         return (dn - black) / (np.float32(white) - black)
     out = np.empty(dn.shape, dtype=np.float32)
     out[..., :4] = (dn[..., :4] - black) / (np.float32(white) - black)
     out[..., 4:] = dn[..., 4:]
+    return out
+
+
+def _normalise_part(dn, black, white, out):
+    np.divide(dn[..., :4] - black, np.float32(white) - black, out=out[..., :4])
+    if dn.shape[-1] > 4:
+        out[..., 4:] = dn[..., 4:]
+
+
+def _in_strips(fn, shape, dtype, strip=256):
+    """out = new array; fn(a, b, out) fills rows a..b of it, on the develop threads (on the
+    calling thread when that is already one of them, which must not wait for the others)."""
+    out = np.empty(shape, dtype=dtype)
+    h = shape[0]
+    if threading.current_thread().name.startswith("develop"):
+        for y in range(0, h, strip):
+            fn(y, min(h, y + strip), out)
+    else:
+        list(_develop_pool().map(lambda y: fn(y, min(h, y + strip), out), range(0, h, strip)))
     return out
 
 
@@ -2421,6 +3267,14 @@ def develop(rgbe, edit, wb, cam_to_rgb, strip=256, dsp=None, oog=None, parallel=
         if exact:                                    # 3-6 (Sony, bit for bit): whole rows, 2 rows of context
             n = part.shape[0]
             a, b = max(0, y - 2), min(h, y + n + 2)
+            if HAVE_NUMBA and rebuilt is None:       #    compiled: straight from the frame rows
+                rows = rgbe[a:b]
+                srgb = render_sony_exact_rows(rows, dsp[2], gain if edit.exposure else None,
+                                              rows[..., 4] if idc else None, rows[..., 5] if idc else None,
+                                              dsp[0], dsp[1], edit.sony_curve, context=(y - a, b - y - n),
+                                              exposure=edit.exposure)
+                finish_sony(y, n, srgb)
+                return
             raw12, detail, kill = sony_input(a, b)
             srgb = render_sony_exact(raw12, dsp[0], dsp[1], edit.sony_curve, detail, kill,
                                      context=(y - a, b - y - n), exposure=edit.exposure)
@@ -2595,13 +3449,13 @@ def develop_finished(rgbe, edit, wb, cam_to_rgb, dsp=None, scale=1.0, oog=None, 
 
 def encode_quantise(lin, space, bits, strip=256):
     """Linear RGB -> transfer curve -> uint8 / uint16."""
-    h = lin.shape[0]
     top = 255.0 if bits == 8 else 65535.0
-    out = np.empty(lin.shape, dtype=np.uint8 if bits == 8 else np.uint16)
-    for y in range(0, h, strip):
-        enc = encode_trc(lin[y:y + strip], space)
-        out[y:y + strip] = (enc * top + 0.5).astype(out.dtype)
-    return out
+    dtype = np.uint8 if bits == 8 else np.uint16
+
+    def part(a, b, out):
+        out[a:b] = (encode_trc(lin[a:b], space) * top + 0.5).astype(dtype)
+
+    return _in_strips(part, lin.shape, dtype, strip)
 
 
 # ==========================================
@@ -7422,6 +8276,8 @@ def main():
     app.setPalette(dark_palette())
     app.setStyleSheet(build_stylesheet())
     _install_error_dialog()
+    if HAVE_NUMBA:                       # compile the fast paths while the window opens
+        threading.Thread(target=_warm_up_or_fall_back, name="numba-warm-up", daemon=True).start()
     window = MainWindow()
     screen = app.primaryScreen()
     if screen is not None:               # never open larger than the screen

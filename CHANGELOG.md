@@ -1,5 +1,13 @@
 # Changelog
 
+## v20.1.0 (2026-10-19)
+
+Faster, with exactly the same output.
+
+- **About 4x faster full-size exports with Sony colour** (4.8 s to 1.2 s for an F828-sized frame on a 4-core machine). IDC's colour processor, its 16-bit output step and its demosaic are compiled with Numba. The numpy versions stay as the reference: every export and preview variant tested is identical to v20 byte for byte.
+- **Faster opening and previews.** IDC's demosaic is about 3x faster, and the preview's downsizing, black subtraction and curve encoding now run on every core.
+- The first launch compiles the fast paths in the background (about 15 s) and keeps them on disk. Without Numba (running from source) the app works as before, at v20's speed.
+
 ## v20.0.0 (2026-10-18)
 
 First public release. Versions 1 to 19 were private.

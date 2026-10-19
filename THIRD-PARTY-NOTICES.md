@@ -9,6 +9,8 @@ This project's own code is under the PolyForm Noncommercial License 1.0.0 (see [
 | [SciPy](https://scipy.org) | BSD-3-Clause | bundled |
 | [rawpy](https://github.com/letmaik/rawpy) | MIT | bundled |
 | [LibRaw](https://www.libraw.org) (inside rawpy) | LGPL-2.1 or CDDL-1.0 | bundled |
+| [Numba](https://numba.pydata.org) | BSD-2-Clause | bundled |
+| [llvmlite](https://github.com/numba/llvmlite) and the LLVM it contains | BSD-2-Clause; LLVM: Apache-2.0 with LLVM exception | bundled |
 | [tifffile](https://github.com/cgohlke/tifffile) | BSD-3-Clause | bundled |
 | [Pillow](https://python-pillow.org) | MIT-CMU (HPND) | bundled |
 | [imagecodecs](https://github.com/cgohlke/imagecodecs) | BSD-3-Clause, plus the licenses of its bundled codec libraries | bundled when installed at build time |

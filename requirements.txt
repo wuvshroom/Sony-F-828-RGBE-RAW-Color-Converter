@@ -1,4 +1,4 @@
-# Versions the v20.0.0 release was tested and built with.
+# Versions the v20.1.0 release was tested and built with.
 # PySide6 stays below 6.12: Qt 6.12 draws the number boxes blank (the app works around it,
 # but 6.11 renders exactly as tested).
 PySide6-Essentials==6.11.2
@@ -7,3 +7,6 @@ scipy>=1.13
 rawpy>=0.23
 tifffile>=2024.1.1
 Pillow>=11.0
+# Compiles the colour processor and demosaic (about 4x faster exports, identical output).
+# The app still runs without it, with numpy doing the same work more slowly.
+numba>=0.60

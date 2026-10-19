@@ -138,7 +138,11 @@ On Windows, from this folder:
 build.bat
 ```
 
-That creates a clean virtual environment, installs `requirements-build.txt` and runs `pyinstaller f828_converter.spec`. The result is `dist\f828_converter.exe` with both camera profiles bundled, plus `dist\f828-lightroom-profiles-v20.0.0.zip`.
+That creates a clean virtual environment, installs `requirements-build.txt` and runs `pyinstaller f828_converter.spec`. The result is `dist\f828_converter.exe` with both camera profiles bundled, plus `dist\f828-lightroom-profiles-v20.1.0.zip`.
+
+## Speed
+
+A full-size export with Sony colour takes about a second on a 4-core machine. The colour processor, its output step and IDC's demosaic are compiled with [Numba](https://numba.pydata.org); the first launch compiles them in the background (about 15 seconds) and keeps them on disk for later launches. Without Numba installed the same steps run in numpy, about 4x slower, with identical output. Setting the environment variable `F828_NO_NUMBA=1` forces the numpy path, for comparing the two.
 
 ## Known issues
 
