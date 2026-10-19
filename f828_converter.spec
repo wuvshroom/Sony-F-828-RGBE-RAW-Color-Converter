@@ -10,6 +10,10 @@
 # whose binary wheels are GPLv2 because they contain x265. The release .exe
 # therefore has no HEIF export; people running from source can install
 # pillow-heif themselves.
+#
+# Numba (BSD) and llvmlite are picked up through pyinstaller-hooks-contrib's hooks.
+# The .exe compiles its kernels on first launch and caches them in the user's
+# cache folder (%LOCALAPPDATA%\numba), so later launches start straight away.
 from PyInstaller.utils.hooks import collect_submodules, collect_delvewheel_libs_directory
 
 datas = [('lightroom-profile/Sony DSC-F828 IDC Real.dcp', 'profiles'),

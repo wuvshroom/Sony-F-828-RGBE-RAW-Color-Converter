@@ -12,10 +12,10 @@ rem pillow-heif is GPL and must not be bundled; the spec excludes it, but keep i
 pip uninstall -y pillow-heif >nul 2>&1
 pyinstaller --noconfirm --clean f828_converter.spec || goto :error
 rem Release asset: the Lightroom profiles with the sidecar tool.
-powershell -NoProfile -Command "Compress-Archive -Force -Path 'lightroom-profile\*.dcp','lightroom-profile\f828_xmp.py','lightroom-profile\f828_dcp.py','lightroom-profile\dng_ref.py','lightroom-profile\README.md','LICENSE' -DestinationPath 'dist\f828-lightroom-profiles-v20.0.0.zip'" || goto :error
+powershell -NoProfile -Command "Compress-Archive -Force -Path 'lightroom-profile\*.dcp','lightroom-profile\f828_xmp.py','lightroom-profile\f828_dcp.py','lightroom-profile\dng_ref.py','lightroom-profile\README.md','LICENSE' -DestinationPath 'dist\f828-lightroom-profiles-v20.1.0.zip'" || goto :error
 echo.
 echo Built dist\f828_converter.exe
-echo Built dist\f828-lightroom-profiles-v20.0.0.zip
+echo Built dist\f828-lightroom-profiles-v20.1.0.zip
 certutil -hashfile dist\f828_converter.exe SHA256
 exit /b 0
 :error
