@@ -1,5 +1,20 @@
 # Changelog
 
+## v21.0.0 (2026-11-16)
+
+A new interface. The processing and the output are unchanged from v20.1.
+
+- **The picture fills the window.** Clear glass panels float over it: the library on the left, Develop on the right, the tools along the top. The glass bends the picture at its rim like a drop of water and lays a light smoke tint over the middle, with no border. Tab hides the library, Shift+Tab the Develop panel.
+- **Appearance menu** (click "F828 Converter"): accent colour, panel and toolbar glass, card shade, blur, rim strength, the ambient light behind the picture, the filmstrip and motion. A standard Windows title bar is one switch away.
+- **Everything moves on springs.** Switches, buttons, section cards, menus, panels and the scope bounce into place, and a slider's knob is a droplet that stretches as you drag it and settles when you let go. The Appearance menu or Windows' own animation setting turns motion off.
+- **New starting settings:** Sony Real colour, As shot white balance, the edge-aware demosaic, the camera's black level, and everything else off or neutral (highlight roll-off off). For exports that match IDC's own files exactly, choose the IDC demosaic under Sensor (or save it as your default). The "..." button in Develop saves your current settings as the starting settings for new images, or goes back to the built-in ones. Crop and straighten are never saved.
+- **The preview opens at 100 %** with "draft while adjusting" on.
+- **A movable scope.** The histogram floats over the picture: drag it anywhere and it springs into the nearest corner. Right-click it (or select it and press Enter) for its size, channels, linear or log scale, resolution and clipping markers, or switch it to a waveform, RGB parade or vectorscope. H shows and hides it.
+- **Develop sections** fold open and shut, show a summary when folded, and each has its own on / off switch (to compare without losing the values) and reset.
+- **Undo and redo** per image (Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z), and **Before** (\\) shows the starting settings with your crop.
+- **Filmstrip:** with the library hidden, thumbnails run along the bottom, with sync and export for ticked images.
+- Export and sync open as sheets over the window. Export progress and results appear in a small card at the bottom with Cancel, Open folder and Details.
+
 ## v20.1.0 (2026-10-19)
 
 Faster, with exactly the same output.

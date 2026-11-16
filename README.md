@@ -24,13 +24,22 @@ The .exe is not code-signed, so Windows SmartScreen may warn the first time. Cli
 - **DNG export with the Sony look embedded:** Lightroom opens the DNG with IDC's colour, white balance and exposure already set.
 - **Export preview:** shows the picture exactly as the saved file will hold it, with its file size.
 
+### Interface
+
+- **The picture fills the window:** clear glass panels float over it, with the library on the left, Develop on the right and the tools along the top. Tab and Shift+Tab hide the side panels.
+- **Appearance menu:** accent colour, glass tint, blur, rim strength, ambient light, filmstrip and motion, or a standard Windows title bar.
+- **Spring motion:** switches, sliders, cards, menus and panels move like jelly; follows Windows' animation setting and can be turned off.
+- **Your own starting settings:** save the current settings as the defaults for new images, or go back to the built-in ones.
+- **Develop sections:** each folds away with a summary and has its own on / off switch and reset.
+- **Undo and redo** per image, and a **Before** view of the starting settings.
+
 ### Development
 
 - **Default rendering:** an Adobe-style colour matrix and sRGB curve, as an alternative to Sony colour.
 - **White balance:** temperature and tint sliders, presets, auto, and a click-to-pick white point.
-- **Exposure and black point:** with a soft highlight roll-off.
+- **Exposure and black point:** with an optional soft highlight roll-off.
 - **Highlight reconstruction:** rebuilds clipped highlights from the channels that did not clip.
-- **Demosaic choice:** IDC, edge-aware, or bilinear.
+- **Demosaic choice:** edge-aware (the starting setting), IDC, or bilinear. Choose IDC for exports that match IDC's own files exactly.
 - **Black level source:** the level the camera recorded in the file (as IDC uses), a level measured from the masked border, or a fixed value.
 - **IR false colour:** an Aerochrome-style false-colour look for infrared shots.
 
@@ -45,7 +54,9 @@ The .exe is not code-signed, so Windows SmartScreen may warn the first time. Cli
 ### Viewing
 
 - **Zoom and pan viewer:** fit, 1:1 and any zoom, with drag-to-pan.
-- **Live RGB histogram and clipping overlay:** shows blown highlights and blocked shadows.
+- **Movable scope:** a live histogram (RGB, luma or both, linear or log, with clipping markers), waveform, RGB parade or vectorscope. Drag it to any corner; right-click for its options.
+- **Clipping overlay:** shows blown highlights and blocked shadows.
+- **Preview quality:** 100 %, 50 % or 25 % previews, with a quick draft while you drag a slider.
 - **Image info:** sensor size, camera settings and EXIF from the raw file.
 
 ### Library and batch
@@ -53,6 +64,7 @@ The .exe is not code-signed, so Windows SmartScreen may warn the first time. Cli
 - **Thumbnail library:** add files or whole folders (optionally with subfolders) by button or drag and drop.
 - **Filter by name:** narrows the library as you type.
 - **Sync edits:** copies chosen edits from one image to all ticked images.
+- **Filmstrip:** thumbnails along the bottom while the library is hidden.
 - **Batch export:** exports every ticked image in the background, using every CPU core.
 
 ### Export
@@ -138,7 +150,7 @@ On Windows, from this folder:
 build.bat
 ```
 
-That creates a clean virtual environment, installs `requirements-build.txt` and runs `pyinstaller f828_converter.spec`. The result is `dist\f828_converter.exe` with both camera profiles bundled, plus `dist\f828-lightroom-profiles-v20.1.0.zip`.
+That creates a clean virtual environment, installs `requirements-build.txt` and runs `pyinstaller f828_converter.spec`. The result is `dist\f828_converter.exe` with both camera profiles bundled, plus `dist\f828-lightroom-profiles-v21.0.0.zip`.
 
 ## Speed
 
