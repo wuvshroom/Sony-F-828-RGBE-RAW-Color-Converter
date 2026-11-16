@@ -6,7 +6,7 @@
 # support for it is not permitted. Modified versions must link to the official repository above in
 # their documentation.
 """
-Sony DSC-F828 RGBE RAW converter  -  v20.1
+Sony DSC-F828 RGBE RAW converter  -  v21
 
   pip install -r requirements.txt     (PySide6 numpy scipy rawpy tifffile Pillow numba)
   (optional)  pip install imagecodecs      -> JPEG XL, LZW / Zstandard TIFF, more JPEG 2000 / AVIF
@@ -114,6 +114,31 @@ New in v20.1:
     and the preview's downsizing run on every core. The first launch compiles
     the fast paths in the background (about 15 s) and keeps them on disk.
 
+New in v21:
+
+  * A new interface: the picture fills the window edge to edge and clear
+    glass panels float over it (library on the left, Develop on the right,
+    the tools along the top). The glass bends the picture at its rim like a
+    drop of water and lays a light smoke tint over the middle; the accent
+    colour, tint, blur, rim strength and motion are in the Appearance menu
+    (click "F828 Converter").
+  * Every control moves on springs: switches, sliders (the knob is a droplet
+    that stretches as you drag it), section cards, menus, panels and the
+    scope. The Appearance menu or the system's reduced-motion setting turns
+    the motion off.
+  * New starting settings: Sony Real colour, As shot white balance, the
+    edge-aware demosaic, the camera's black level, everything else off or
+    neutral (highlight roll-off off). "..." in the Develop panel saves your
+    current settings as the starting settings for new images, or goes back
+    to the built-in ones.
+  * The preview opens at 100 % resolution with "draft while adjusting" on.
+  * The histogram floats over the picture: drag it anywhere and it snaps to
+    the nearest corner. Right-click it for its size, channels, linear or log
+    scale, resolution and clipping markers, or switch it to a waveform, RGB
+    parade or vectorscope.
+  * Each Develop section has its own on / off switch and reset, undo / redo
+    per image (Ctrl+Z / Ctrl+Y), and Before shows the starting settings.
+
 Run:   python f828_converter.py            (or pass .SRF files / folders as arguments)
 Build: pyinstaller f828_converter.spec      (one .exe, with the profiles and the codecs installed)
 
@@ -124,6 +149,7 @@ the interface.
 import collections
 import concurrent.futures
 import datetime
+import functools
 import gc
 import io
 import json
@@ -133,6 +159,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import zlib
 from dataclasses import dataclass, replace
@@ -172,19 +199,23 @@ def _kernel(fn):
     """Compiled with Numba when it is installed (releases the GIL, so the develop threads
     run in parallel); otherwise the plain function, which is then never called."""
     return numba.njit(nogil=True, cache=_NUMBA_CACHE)(fn) if HAVE_NUMBA else fn
-from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal, qVersion
-from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QKeySequence,
-                         QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap,
-                         QPolygonF, QRadialGradient, QShortcut, QTextOption)
+from PySide6.QtCore import (QByteArray, QElapsedTimer, QEvent, QObject, QPoint, QPointF, QRect,
+                          QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal, qVersion)
+from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetricsF, QIcon,
+                         QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPalette,
+                         QPen, QPixmap, QPolygonF, QRegion, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QAbstractSpinBox, QApplication,
-                             QButtonGroup, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                             QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMessageBox, QProgressDialog, QPushButton,
-                             QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget,
-                             QToolButton, QVBoxLayout, QWidget)
+                             QComboBox, QDialog, QFileDialog, QFrame, QGraphicsOpacityEffect,
+                             QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                             QMessageBox, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
+                             QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
+try:                                     # icons are drawn from SVG when QtSvg is there
+    from PySide6.QtSvg import QSvgRenderer
+except Exception:
+    QSvgRenderer = None
 
 APP_NAME = "F828 RGBE Converter"
-APP_VERSION = "20.1"
+APP_VERSION = "21.0.0"
 SOFTWARE_TAG = f"{APP_NAME} v{APP_VERSION}"
 RAW_EXTENSIONS = (".srf",)
 
@@ -5131,9 +5162,80 @@ class PreviewRenderer:
 # =====================================================================
 # PART 2  -  INTERFACE
 # =====================================================================
+# v21: the picture fills the window edge to edge and clear glass panels float
+# over it. The glass is drawn here rather than by the system, so it looks the
+# same everywhere: each panel takes the part of the picture behind it, blurs it
+# a little, bends it near the rim the way the edge of a water drop bends light,
+# and lays a thin smoke tint over the middle that thins out toward the rim.
+# There is no border and no sheen. Every control moves on springs, which the
+# Appearance menu (click "F828 Converter") or the system's reduced-motion
+# setting turns off.
 
-ACCENT = "#0A84FF"
-TEXT = "#ECECF1"
+APPEARANCE_DEFAULTS = {
+    "accent": "#7394ff",      # buttons that are on, sliders, the primary button
+    "panel_tint": 16,         # smoke tint of the library and Develop panels, %
+    "bar_tint": 1,            # ... of the top bar groups and the filmstrip, %
+    "card_shade": 8,          # shade of the cards inside the panels, %
+    "blur": 3,                # how much the glass blurs what is behind it, px
+    "refraction": 55,         # how strongly the rim bends the picture, %
+    "ambient": True,          # the picture's colours glow softly around it
+    "filmstrip": True,        # thumbnails along the bottom while the library is hidden
+    "motion": True,           # spring animations
+    "native_frame": False,    # the standard Windows title bar instead of the built-in one
+}
+ACCENT_CHOICES = ["#7394ff", "#4cc2ff", "#ffb454", "#d6d6dc"]
+APPEARANCE = dict(APPEARANCE_DEFAULTS)
+APPEARANCE_VERSION = [0]               # bumped whenever the appearance changes (glass caches key on it)
+TEXT = "#f4f4f6"
+MUTED = "#c6c6cc"
+SMOKE = (18, 18, 21)                   # colour of the glass tint
+FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "SF Pro Text", "Inter",
+                 "Helvetica Neue", "Arial"]
+MONO_FAMILIES = ["Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New"]
+
+
+def accent(alpha=None):
+    c = QColor(APPEARANCE["accent"])
+    if not c.isValid():
+        c = QColor(APPEARANCE_DEFAULTS["accent"])
+    if alpha is not None:
+        c.setAlphaF(float(alpha))
+    return c
+
+
+def rgba(r, g, b, a=1.0):
+    c = QColor(int(r), int(g), int(b))
+    c.setAlphaF(max(0.0, min(1.0, float(a))))
+    return c
+
+
+def white(a):
+    return rgba(255, 255, 255, a)
+
+
+def black(a):
+    return rgba(0, 0, 0, a)
+
+
+def ui_font(px=13.0, weight=None, tabular=True, mono=False):
+    f = QFont()
+    f.setFamilies(MONO_FAMILIES if mono else FONT_FAMILIES)
+    f.setPixelSize(max(1, int(round(px))))
+    if weight is not None:
+        f.setWeight(QFont.Weight(int(weight)))
+    if tabular and not mono:
+        try:
+            f.setFeature(QFont.Tag("tnum"), 1)
+        except Exception:
+            pass
+    return f
+
+
+def rounded(rect, r):
+    path = QPainterPath()
+    r = max(0.0, min(float(r), rect.width() / 2.0, rect.height() / 2.0))
+    path.addRoundedRect(rect, r, r)
+    return path
 
 
 def array_to_pixmap(arr):
@@ -5143,199 +5245,1043 @@ def array_to_pixmap(arr):
     return QPixmap.fromImage(QImage(buf, w, h, 3 * w, QImage.Format.Format_RGB888))
 
 
+def array_to_image(arr):
+    """uint8 RGB array -> QImage that owns its pixels."""
+    arr = np.ascontiguousarray(arr, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    return QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+
+
 def dark_palette():
     pal = QPalette()
     role = QPalette.ColorRole
-    for r, col in ((role.Window, "#15161B"), (role.WindowText, TEXT), (role.Base, "#1B1C22"),
-                   (role.AlternateBase, "#20222A"), (role.ToolTipBase, "#1C1D22"),
-                   (role.ToolTipText, TEXT), (role.Text, TEXT), (role.Button, "#24262E"),
+    for r, col in ((role.Window, "#161618"), (role.WindowText, TEXT), (role.Base, "#1b1b1f"),
+                   (role.AlternateBase, "#202024"), (role.ToolTipBase, "#1c1c20"),
+                   (role.ToolTipText, TEXT), (role.Text, TEXT), (role.Button, "#26262b"),
                    (role.ButtonText, TEXT), (role.BrightText, "#FFFFFF"),
-                   (role.Highlight, ACCENT), (role.HighlightedText, "#FFFFFF"),
-                   (role.Link, "#5AB0FF"), (role.PlaceholderText, "#8A8B94")):
+                   (role.Highlight, APPEARANCE["accent"]), (role.HighlightedText, "#FFFFFF"),
+                   (role.Link, "#8fd3ff"), (role.PlaceholderText, "#a8a8b0")):
         pal.setColor(r, QColor(col))
     for r in (role.Text, role.ButtonText, role.WindowText):
-        pal.setColor(QPalette.ColorGroup.Disabled, r, QColor("#6C6D76"))
+        pal.setColor(QPalette.ColorGroup.Disabled, r, QColor("#76767e"))
     return pal
 
 
-def _arrow_image_path():
-    """Small down-arrow for combo boxes (Qt style sheets need it as an image file)."""
-    path = os.path.join(tempfile.gettempdir(), "f828_converter_arrow.png")
+# ---------------------------------------------------------------------
+# Motion: one timer drives every animation; springs do the moving
+# ---------------------------------------------------------------------
+
+def _system_reduces_motion():
+    """Windows' 'Animation effects' setting (Settings > Accessibility > Visual effects)."""
+    if sys.platform != "win32":
+        return False
     try:
-        pix = QPixmap(20, 12)
-        pix.fill(QColor(0, 0, 0, 0))
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(236, 236, 241, 200))
-        p.drawPolygon(QPolygonF([QPointF(4.0, 3.0), QPointF(16.0, 3.0), QPointF(10.0, 10.0)]))
-        p.end()
-        pix.save(path, "PNG")
+        import ctypes
+        on = ctypes.c_int(1)
+        if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0):   # SPI_GETCLIENTAREAANIMATION
+            return not bool(on.value)
     except Exception:
         pass
-    return path.replace("\\", "/")
+    return False
 
 
-def _check_image_path():
-    """White tick for the library's check boxes."""
-    path = os.path.join(tempfile.gettempdir(), "f828_converter_check.png")
-    try:
-        pix = QPixmap(32, 32)
-        pix.fill(QColor(0, 0, 0, 0))
-        p = QPainter(pix)
+_REDUCED_MOTION = [None]
+
+
+def motion_on():
+    if _REDUCED_MOTION[0] is None:
+        _REDUCED_MOTION[0] = _system_reduces_motion()
+    return bool(APPEARANCE.get("motion", True)) and not _REDUCED_MOTION[0]
+
+
+class Animator(QObject):
+    """Steps every running animation about 60 times a second, then stops."""
+
+    def __init__(self):
+        super().__init__()
+        self._items = {}
+        self._clock = QElapsedTimer()
+        self._last = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(15)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+
+    def add(self, key, fn):
+        self._items[key] = fn
+        if not self._timer.isActive():
+            self._clock.start()
+            self._last = 0
+            self._timer.start()
+
+    def remove(self, key):
+        self._items.pop(key, None)
+
+    def running(self, key):
+        return key in self._items
+
+    def _tick(self):
+        now = self._clock.elapsed()
+        dt = min(0.034, max(0.001, (now - self._last) / 1000.0))
+        self._last = now
+        for key, fn in list(self._items.items()):
+            try:
+                keep = fn(dt)
+            except RuntimeError:                 # the widget it belonged to is gone
+                keep = False
+            except Exception:
+                sys.stderr.write(traceback.format_exc())
+                keep = False
+            if not keep and self._items.get(key) is fn:
+                del self._items[key]
+        if not self._items:
+            self._timer.stop()
+
+
+_ANIMATOR = [None]
+
+
+def animator():
+    if _ANIMATOR[0] is None:
+        _ANIMATOR[0] = Animator()
+    return _ANIMATOR[0]
+
+
+class Spring:
+    """A damped spring (unit mass): x is pulled toward target with stiffness k and damping c."""
+    __slots__ = ("x", "v", "target", "k", "c", "eps")
+
+    def __init__(self, x=0.0, k=400.0, c=26.0, eps=0.002):
+        self.x = self.target = float(x)
+        self.v = 0.0
+        self.k, self.c, self.eps = float(k), float(c), float(eps)
+
+    def step(self, dt):
+        h = dt / 4.0
+        for _ in range(4):
+            self.v += (-self.k * (self.x - self.target) - self.c * self.v) * h
+            self.x += self.v * h
+
+    def settled(self):
+        return abs(self.x - self.target) < self.eps and abs(self.v) < self.eps * 20.0
+
+    def snap(self, value=None):
+        if value is not None:
+            self.target = float(value)
+        self.x = self.target
+        self.v = 0.0
+
+    def set(self, target, k=None, c=None):
+        self.target = float(target)
+        if k is not None:
+            self.k = float(k)
+        if c is not None:
+            self.c = float(c)
+
+
+class SpringDriver:
+    """Runs a set of springs on the shared timer and calls `on_frame` after each
+    step until they all rest (with motion off they jump straight to rest)."""
+
+    def __init__(self, on_frame, on_step=None, on_done=None):
+        self.on_frame = on_frame
+        self.on_step = on_step                   # optional: called with dt before each frame
+        self.on_done = on_done                   # optional: called once everything has come to rest
+        self.springs = []
+        self._key = object()
+        self.hold = None                         # optional callable: keep running while it returns True
+
+    def spring(self, x=0.0, k=400.0, c=26.0, eps=0.002):
+        s = Spring(x, k, c, eps)
+        self.springs.append(s)
+        return s
+
+    def kick(self):
+        if not motion_on():
+            for s in self.springs:
+                s.snap()
+            if self.on_step:
+                self.on_step(10.0)
+            self.on_frame()
+            if self.on_done:
+                self.on_done()
+            return
+        animator().add(self._key, self._frame)
+
+    def running(self):
+        return animator().running(self._key)
+
+    def stop(self):
+        animator().remove(self._key)
+
+    def _frame(self, dt):
+        if self.on_step:
+            self.on_step(dt)
+        for s in self.springs:
+            s.step(dt)
+        done = all(s.settled() for s in self.springs) and not (self.hold and self.hold())
+        if done:
+            for s in self.springs:
+                s.snap()
+        self.on_frame()
+        if done and self.on_done:
+            self.on_done()
+        return not done
+
+
+def jello_scale(t):
+    """The 'blob' squash used when a switch knob lands: (sx, sy) over t in 0..1."""
+    keys = ((0.0, 1.0, 1.0), (0.22, 1.38, 0.7), (0.5, 0.88, 1.12), (0.74, 1.06, 0.96), (1.0, 1.0, 1.0))
+    t = min(max(t, 0.0), 1.0)
+    for (t0, x0, y0), (t1, x1, y1) in zip(keys, keys[1:]):
+        if t <= t1:
+            f = (t - t0) / (t1 - t0)
+            f = f * f * (3 - 2 * f)
+            return x0 + (x1 - x0) * f, y0 + (y1 - y0) * f
+    return 1.0, 1.0
+
+
+# ---------------------------------------------------------------------
+# Icons (drawn from small SVGs in the text colour)
+# ---------------------------------------------------------------------
+
+_SVG = {
+    "sidebar_l": '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
+    "sidebar_r": '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/>',
+    "quality": '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/>',
+    "move": '<path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3"/>',
+    "crop": '<path d="M6 2v16h16M2 6h16v16"/>',
+    "pick": '<path d="M16 4a2.8 2.8 0 0 1 4 4l-3 3-4-4zM13 7l-9 9v4h4l9-9"/>',
+    "undo": '<path d="M8 5L3 10l5 5M3 10h11a5.5 5.5 0 0 1 0 11h-3"/>',
+    "redo": '<path d="M16 5l5 5-5 5M21 10H10a5.5 5.5 0 0 0 0 11h3"/>',
+    "before": '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 2v20"/>',
+    "clipping": '<path d="M12 4l9 16H3zM12 10v5M12 17.5v.5"/>',
+    "eye": '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    "scope": '<path d="M3 20h18M4 20c2-1 3-9 5-9s2 5 4 5 2-11 4-11 2 12 3 15"/>',
+    "reset": '<path d="M4.5 12a7.5 7.5 0 1 0 2.4-5.5M4 4.5v4.5h4.5"/>',
+    "more": '<circle cx="5" cy="12" r="1.9" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.9" '
+            'fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.9" fill="currentColor" stroke="none"/>',
+    "plus": '<path d="M12 5v14M5 12h14"/>',
+    "minus": '<path d="M5 12h14"/>',
+    "rot_l": '<rect x="10" y="10" width="11" height="11" rx="2"/><path d="M14 4H9a4 4 0 0 0-4 4v5"/>'
+             '<path d="M2.5 10.5L5 13l2.5-2.5"/>',
+    "rot_r": '<rect x="3" y="10" width="11" height="11" rx="2"/><path d="M10 4h5a4 4 0 0 1 4 4v5"/>'
+             '<path d="M16.5 10.5L19 13l2.5-2.5"/>',
+    "flip_h": '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 7L3 17h6zM15 7l6 10h-6z"/>',
+    "flip_v": '<path d="M3 12h18" stroke-dasharray="2 2.2"/><path d="M7 9L17 3v6zM7 15l10 6v-6z"/>',
+    "close": '<path d="M6 6l12 12M18 6L6 18"/>',
+    "folder": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    "image": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 16l5-5 4 4 3-3 6 6"/>',
+}
+_SVG_SMALL = {      # 10 x 10 view box
+    "chev_d": '<path d="M1.5 3.5L5 7l3.5-3.5"/>',
+    "chev_r": '<path d="M3 1l4 4-4 4"/>',
+}
+_ICON_CACHE = {}
+
+
+def icon_pixmap(name, size, color, dpr=1.0, stroke=None):
+    """The named icon as a pixmap of size x size logical pixels."""
+    key = (name, int(size), QColor(color).rgba(), round(float(dpr), 2), stroke)
+    pix = _ICON_CACHE.get(key)
+    if pix is not None:
+        return pix
+    small = name in _SVG_SMALL
+    body = _SVG_SMALL[name] if small else _SVG.get(name, "")
+    col = QColor(color)
+    hexcol = col.name(QColor.NameFormat.HexRgb)
+    sw = stroke if stroke is not None else (1.6 if small else 1.8)
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {10 if small else 24} {10 if small else 24}" '
+           f'fill="none" stroke="{hexcol}" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round">'
+           f'{body.replace("currentColor", hexcol)}</svg>')
+    px = max(1, int(round(size * dpr)))
+    img = QImage(px, px, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    if QSvgRenderer is not None:
+        r = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(255, 255, 255), 4.5)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.drawPolyline(QPolygonF([QPointF(7.0, 16.5), QPointF(13.5, 23.0), QPointF(25.0, 9.5)]))
+        p.setOpacity(col.alphaF())
+        r.render(p, QRectF(0, 0, px, px))
         p.end()
-        pix.save(path, "PNG")
-    except Exception:
-        pass
-    return path.replace("\\", "/")
+    pix = QPixmap.fromImage(img)
+    pix.setDevicePixelRatio(dpr)
+    if len(_ICON_CACHE) > 600:
+        _ICON_CACHE.clear()
+    _ICON_CACHE[key] = pix
+    return pix
 
 
-def build_stylesheet():
-    arrow = _arrow_image_path()
-    check = _check_image_path()
-    # Qt 6.12 squeezes the text field of a spin box without buttons to 1 px when a style sheet
-    # sets its padding, so every number box shows blank. Anchoring the hidden buttons to the
-    # border gives the text its width back (with less left padding). Earlier Qt needs nothing.
-    qt = tuple(int(p) for p in qVersion().split(".")[:2])
-    spin_fix = ("QAbstractSpinBox::up-button, QAbstractSpinBox::down-button "
-                "{ width: 0px; subcontrol-origin: border; }" if qt >= (6, 12) else "")
-    return f"""
-    QWidget {{ color: {TEXT}; font-family: "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", "Inter", "Helvetica Neue", sans-serif; font-size: 13px; }}
-    QDialog {{ background: #16171C; }}
-    QToolTip {{ background: #1C1D22; color: {TEXT}; border: 1px solid rgba(255,255,255,45); padding: 4px 8px; }}
-    QLabel {{ background: transparent; }}
-    QLabel#h1 {{ font-size: 16px; font-weight: 600; }}
-    QLabel#cardTitle {{ color: rgba(236,236,241,150); font-size: 11px; font-weight: 600; }}
-    QLabel#muted {{ color: rgba(236,236,241,150); font-size: 12px; }}
-    QLabel#mono {{ font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 11px; color: rgba(236,236,241,185); }}
-    QLabel#zoom {{ color: rgba(236,236,241,215); font-size: 12px; }}
+def draw_icon(p, name, rect, color, shadow=False, stroke=None):
+    """Draw an icon centred in rect (QRectF), optionally with a soft drop shadow."""
+    size = min(rect.width(), rect.height())
+    dpr = max(1.0, p.device().devicePixelRatioF()) if p.device() is not None else 1.0
+    x = rect.x() + (rect.width() - size) / 2.0
+    y = rect.y() + (rect.height() - size) / 2.0
+    if shadow:
+        sh = icon_pixmap(name, size, QColor(0, 0, 0, 150), dpr, stroke)
+        p.drawPixmap(QPointF(x, y + 1.0), sh)
+    p.drawPixmap(QPointF(x, y), icon_pixmap(name, size, color, dpr, stroke))
 
-    QFrame#glass {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255,255,255,40), stop:0.03 rgba(255,255,255,20), stop:1 rgba(255,255,255,11));
-        border: 1px solid rgba(255,255,255,42); border-radius: 20px; }}
-    QFrame#card {{ background: rgba(255,255,255,13); border: 1px solid rgba(255,255,255,24); border-radius: 14px; }}
-    QFrame#pill {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(70,72,84,190), stop:1 rgba(30,31,38,190));
-        border: 1px solid rgba(255,255,255,60); border-radius: 21px; }}
-    QFrame#status {{ background: rgba(30,31,38,200); border: 1px solid rgba(255,255,255,55); border-radius: 13px; }}
-    QFrame#popover {{ background: rgba(27,28,35,236); border: 1px solid rgba(255,255,255,60); border-radius: 16px; }}
-    QFrame#sep {{ background: rgba(255,255,255,45); border: none; }}
-    QWidget#clear {{ background: transparent; }}
-    QScrollArea {{ background: transparent; border: none; }}
-    QScrollArea > QWidget > QWidget {{ background: transparent; }}
 
-    QPushButton {{ background: rgba(255,255,255,22); border: 1px solid rgba(255,255,255,40); border-radius: 10px; padding: 6px 10px; }}
-    QPushButton:hover {{ background: rgba(255,255,255,38); }}
-    QPushButton:pressed {{ background: rgba(255,255,255,14); }}
-    QPushButton:disabled {{ color: rgba(236,236,241,85); background: rgba(255,255,255,9); border-color: rgba(255,255,255,18); }}
-    QPushButton#glyph {{ font-size: 17px; padding: 3px 4px; }}
-    QPushButton#primary {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3D9DFF, stop:1 #0A6BE6);
-        border: 1px solid rgba(255,255,255,80); border-radius: 12px; padding: 10px 14px; font-weight: 600; color: white; }}
-    QPushButton#primary:hover {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #57ABFF, stop:1 #1F7BF2); }}
-    QPushButton#primary:disabled {{ background: rgba(10,132,255,60); color: rgba(255,255,255,110); border-color: rgba(255,255,255,25); }}
+def draw_text(p, rect, flags, text, color, shadow=0.0, font=None):
+    """Text with an optional 1 px drop shadow (for text that sits on clear glass)."""
+    if font is not None:
+        p.setFont(font)
+    if shadow > 0:
+        p.setPen(black(shadow))
+        p.drawText(rect.translated(0, 1), flags, text)
+    p.setPen(QColor(color))
+    p.drawText(rect, flags, text)
 
-    QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 10px; padding: 5px 10px; }}
-    QToolButton:hover {{ background: rgba(255,255,255,30); }}
-    QToolButton:pressed {{ background: rgba(255,255,255,16); }}
-    QToolButton:checked {{ background: rgba(10,132,255,170); border-color: rgba(255,255,255,70); }}
-    QToolButton:disabled {{ color: rgba(236,236,241,80); }}
 
-    QComboBox {{ background: rgba(255,255,255,22); border: 1px solid rgba(255,255,255,40); border-radius: 9px; padding: 5px 10px; min-height: 18px; }}
-    QComboBox:hover {{ background: rgba(255,255,255,34); }}
-    QComboBox:disabled {{ color: rgba(236,236,241,85); }}
-    QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right; width: 26px; border: none; }}
-    QComboBox::down-arrow {{ image: url("{arrow}"); width: 10px; height: 6px; }}
-    QComboBox QAbstractItemView {{ background: #22232A; border: 1px solid rgba(255,255,255,50); selection-background-color: {ACCENT}; outline: none; padding: 4px; }}
+# ---------------------------------------------------------------------
+# Glass
+# ---------------------------------------------------------------------
+# r: corner radius; tint: alpha of the smoke tint (or the appearance key that
+# holds it, in %); fe: how far in from the rim the tint starts; band / depth: the
+# width of the bending rim and how far it pulls the picture in at 55 % refraction;
+# shadow: (y offset, blur, spread, alpha) of the one soft shadow.
 
-    QLineEdit, QAbstractSpinBox {{ background: rgba(0,0,0,70); border: 1px solid rgba(255,255,255,32); border-radius: 8px; padding: 4px 8px; selection-background-color: {ACCENT}; }}
-    QLineEdit:focus, QAbstractSpinBox:focus {{ border-color: {ACCENT}; }}
-    {spin_fix}
+GLASS_KINDS = {
+    "panel": dict(r=18.0, tint="panel_tint", fe=9.0, band=24.0, depth=12.0, shadow=(26.0, 50.0, -22.0, 0.5)),
+    "grp": dict(r=12.0, tint="bar_tint", fe=3.0, band=10.0, depth=5.0, shadow=(26.0, 50.0, -22.0, 0.5)),
+    "hud": dict(r=14.0, tint=0.44, fe=5.0, band=10.0, depth=5.0, shadow=(26.0, 50.0, -22.0, 0.5)),
+    "strip": dict(r=16.0, tint="bar_tint", fe=5.0, band=14.0, depth=7.0, shadow=(26.0, 50.0, -22.0, 0.5)),
+    # menus, sheets and toasts sit over text, so they blur at least this much (px)
+    "pop": dict(r=14.0, tint=0.76, fe=7.0, band=16.0, depth=8.0, shadow=(28.0, 56.0, -18.0, 0.6), blur=14.0),
+    "sheet": dict(r=20.0, tint=0.82, fe=10.0, band=24.0, depth=12.0, shadow=(40.0, 90.0, -20.0, 0.7),
+                  blur=20.0),
+    "toast": dict(r=14.0, tint=0.62, fe=5.0, band=10.0, depth=5.0, shadow=(20.0, 40.0, -16.0, 0.5), blur=10.0),
+}
 
-    QSlider:horizontal {{ min-height: 22px; }}
-    QSlider::groove:horizontal {{ height: 4px; border-radius: 2px; background: rgba(255,255,255,48); }}
-    QSlider::sub-page:horizontal {{ height: 4px; border-radius: 2px; background: {ACCENT}; }}
-    QSlider::handle:horizontal {{ width: 14px; margin: -6px 0; border-radius: 8px; background: #F6F6F8; border: 1px solid rgba(0,0,0,90); }}
-    QSlider::handle:horizontal:hover {{ background: #FFFFFF; }}
-    QSlider::handle:horizontal:disabled {{ background: #8E8F97; }}
-    QSlider#centered::sub-page:horizontal {{ background: rgba(255,255,255,48); }}
-    QSlider#temp::groove:horizontal {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3F86FF, stop:0.5 #EDEDED, stop:1 #FFB13B); }}
-    QSlider#temp::sub-page:horizontal {{ background: transparent; }}
-    QSlider#tint::groove:horizontal {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #34C759, stop:0.5 #EDEDED, stop:1 #E24FD8); }}
-    QSlider#tint::sub-page:horizontal {{ background: transparent; }}
 
-    QListWidget {{ background: transparent; border: none; outline: none; }}
-    QListWidget::item {{ border-radius: 10px; padding: 5px; margin: 1px 0; }}
-    QListWidget::item:selected {{ background: rgba(10,132,255,120); color: white; }}
-    QListWidget::item:hover:!selected {{ background: rgba(255,255,255,18); }}
-    QListView::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid rgba(255,255,255,105); background: rgba(0,0,0,80); }}
-    QListView::indicator:hover {{ border-color: rgba(255,255,255,180); }}
-    QListView::indicator:checked {{ background: {ACCENT}; border-color: rgba(255,255,255,140); image: url("{check}"); }}
+def glass_tint(kind):
+    t = GLASS_KINDS[kind]["tint"]
+    if isinstance(t, str):
+        return max(0.0, min(0.95, float(APPEARANCE.get(t, 0)) / 100.0))
+    return float(t)
 
-    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: rgba(255,255,255,55); border-radius: 3px; min-height: 30px; }}
-    QScrollBar::handle:vertical:hover {{ background: rgba(255,255,255,90); }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
-    QSplitter::handle {{ background: transparent; }}
-    QProgressBar {{ border: 1px solid rgba(255,255,255,40); border-radius: 7px; background: rgba(0,0,0,70); text-align: center; height: 14px; }}
-    QProgressBar::chunk {{ background: {ACCENT}; border-radius: 6px; }}
-    """
+
+@functools.lru_cache(maxsize=64)
+def _lens_indices(w, h, r, band, depth10):
+    """Pixel moves that make the rim of a w x h rounded rectangle (device pixels)
+    bend the picture: each pixel within `band` of the edge shows the picture from
+    up to depth10 / 10 pixels further in, most at the very rim."""
+    depth = depth10 / 10.0
+    band = int(min(band, w // 2, h // 2))
+    if band < 2 or depth < 0.5 or w < 4 or h < 4:
+        return None
+    r = float(min(r, w / 2.0, h / 2.0))
+    rows = np.concatenate([np.arange(band), np.arange(h - band, h)])
+    y1, x1 = np.meshgrid(rows, np.arange(w), indexing="ij")
+    cols = np.concatenate([np.arange(band), np.arange(w - band, w)])
+    y2, x2 = np.meshgrid(np.arange(band, h - band), cols, indexing="ij")
+    X = np.concatenate([x1.ravel(), x2.ravel()]).astype(np.float32)
+    Y = np.concatenate([y1.ravel(), y2.ravel()]).astype(np.float32)
+    px, py = X + 0.5 - w / 2.0, Y + 0.5 - h / 2.0
+    qx, qy = np.abs(px) - (w / 2.0 - r), np.abs(py) - (h / 2.0 - r)
+    ox, oy = np.maximum(qx, 0.0), np.maximum(qy, 0.0)
+    out = np.hypot(ox, oy)
+    e = -(out + np.minimum(np.maximum(qx, qy), 0.0) - r)      # distance in from the rim
+    keep = (e >= 0.0) & (e < band)
+    corner = (qx > 0) & (qy > 0)
+    inv = 1.0 / np.maximum(out, 1e-6)
+    nx = np.where(corner, ox * inv, (qx >= qy).astype(np.float32)) * np.sign(px)
+    ny = np.where(corner, oy * inv, (qy > qx).astype(np.float32)) * np.sign(py)
+    t = depth * (1.0 - e / band) ** 2
+    sx = np.clip(np.rint(X - nx * t), 0, w - 1).astype(np.int64)
+    sy = np.clip(np.rint(Y - ny * t), 0, h - 1).astype(np.int64)
+    dst = (Y.astype(np.int64) * w + X.astype(np.int64))[keep]
+    src = (sy * w + sx)[keep]
+    return dst, src
+
+
+def make_glass(source, rect_dev, kind, dpr):
+    """The glass fill for a rounded rectangle: the part of `source` (a QImage)
+    under rect_dev (device pixels), blurred and bent at the rim. Returns a
+    QImage with the device pixel ratio set, or None."""
+    w, h = int(rect_dev.width()), int(rect_dev.height())
+    if w < 2 or h < 2 or source is None or source.isNull():
+        return None
+    img = source.copy(rect_dev).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    spec = GLASS_KINDS[kind]
+    blur = max(float(APPEARANCE.get("blur", 3)), spec.get("blur", 0.0)) * dpr
+    ignore, smooth = Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+    if 1.0 <= blur <= 8.0:
+        sw, sh = max(1, int(round(w / blur))), max(1, int(round(h / blur)))
+        img = img.scaled(sw, sh, ignore, smooth).scaled(w, h, ignore, smooth)
+    elif blur > 8.0:                     # strong blur: shrink, soften the small copy, grow back
+        f = blur / 3.0
+        sw, sh = max(2, int(round(w / f))), max(2, int(round(h / f)))
+        small = img.scaled(sw, sh, ignore, smooth).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        bpl = small.bytesPerLine()
+        a = np.frombuffer(small.constBits(), np.uint8, sh * bpl).reshape(sh, bpl)[:, :sw * 4]
+        a = gaussian_filter(a.reshape(sh, sw, 4).astype(np.float32), sigma=(1.3, 1.3, 0), mode="nearest")
+        a = np.ascontiguousarray(np.clip(a + 0.5, 0, 255).astype(np.uint8))
+        small = QImage(a.data, sw, sh, 4 * sw, QImage.Format.Format_ARGB32_Premultiplied).copy()
+        img = small.scaled(w, h, ignore, smooth)
+    refr = float(APPEARANCE.get("refraction", 55)) / 55.0
+    lens = _lens_indices(w, h, int(round(spec["r"] * dpr)), int(round(spec["band"] * dpr)),
+                         int(round(spec["depth"] * refr * dpr * 10)))
+    if lens is not None:
+        dst, src = lens
+        pixels = np.frombuffer(img.constBits(), np.uint32, w * h).copy()
+        bent = pixels.copy()
+        bent[dst] = pixels[src]
+        img = QImage(bent.data, w, h, 4 * w, QImage.Format.Format_ARGB32_Premultiplied).copy()
+    img.setDevicePixelRatio(dpr)
+    return img
+
+
+def paint_tint(p, rect, r, alpha, fe, color=SMOKE):
+    """A smoke tint that is full strength in the middle and fades out toward the rim."""
+    if alpha <= 0.001:
+        return
+    n = 4
+    a = 1.0 - (1.0 - min(alpha, 0.98)) ** (1.0 / n)
+    col = rgba(color[0], color[1], color[2], a)
+    for i in range(n):
+        inset = fe * (0.5 + i / float(n - 1))
+        rr = rect.adjusted(inset, inset, -inset, -inset)
+        if rr.width() <= 1 or rr.height() <= 1:
+            break
+        p.fillPath(rounded(rr, max(0.0, r - inset)), col)
+
+
+@functools.lru_cache(maxsize=48)
+def _tint_image(w, h, dpr, r, fe, alpha1000):
+    """The smoke tint on its own (it does not depend on the picture), w x h device pixels."""
+    img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(dpr)
+    img.fill(Qt.GlobalColor.transparent)
+    q = QPainter(img)
+    q.setRenderHint(QPainter.RenderHint.Antialiasing)
+    paint_tint(q, QRectF(0.0, 0.0, w / dpr, h / dpr), r, alpha1000 / 1000.0, fe)
+    q.end()
+    return img
+
+
+@functools.lru_cache(maxsize=96)
+def _shadow_image(w, h, r, blur, spread, alpha100):
+    """A blurred rounded-rectangle shadow (quarter resolution), padded by `blur`."""
+    s = 0.25
+    pad = blur
+    W, H = max(2, int((w + 2 * pad) * s) + 2), max(2, int((h + 2 * pad) * s) + 2)
+    img = QImage(W, H, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(s, s)
+    body = QRectF(pad - spread, pad - spread, w + 2 * spread, h + 2 * spread)
+    if body.width() > 1 and body.height() > 1:
+        p.fillPath(rounded(body, max(0.0, r + spread)), QColor(0, 0, 0, 255))
+    p.end()
+    a = np.frombuffer(img.constBits(), np.uint8, W * H * 4).reshape(H, W, 4)[:, :, 3].astype(np.float32)
+    a = gaussian_filter(a, sigma=max(0.5, blur * s / 2.0)) * (alpha100 / 100.0)
+    out = np.zeros((H, W, 4), np.uint8)
+    out[:, :, 3] = np.clip(a, 0, 255).astype(np.uint8)          # black, premultiplied: only alpha
+    res = QImage(out.data, W, H, 4 * W, QImage.Format.Format_ARGB32_Premultiplied).copy()
+    return res
+
+
+def paint_shadow(p, rect, r, shadow, exclude=True):
+    """One soft drop shadow under rect, like CSS box-shadow: 0 dy blur spread."""
+    dy, blur, spread, alpha = shadow
+    w, h = int(round(rect.width())), int(round(rect.height()))
+    if w < 2 or h < 2 or alpha <= 0:
+        return
+    img = _shadow_image(w, h, int(r), int(blur), int(spread), int(round(alpha * 100)))
+    target = QRectF(rect.x() - blur, rect.y() - blur + dy, w + 2 * blur, h + 2 * blur)
+    p.save()
+    if exclude:
+        clip = QPainterPath()
+        clip.setFillRule(Qt.FillRule.OddEvenFill)
+        clip.addRect(target.adjusted(-2, -2, 2, 2))
+        clip.addPath(rounded(rect.adjusted(0.5, 0.5, -0.5, -0.5), r))
+        p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    p.drawImage(target, img)
+    p.restore()
+
+
+def paint_small_shadow(p, path, dy=1.0, alpha=0.4, spread=1.0, steps=2):
+    """A cheap small shadow for buttons and knobs: a few offset fills."""
+    for i in range(steps, 0, -1):
+        p.save()
+        p.translate(0, dy * i / steps + 0.0)
+        p.fillPath(path, black(alpha / (steps + 1.0)))
+        p.restore()
+
+
+class StaticSource:
+    """A glass source made from a still picture of the window (for menus and sheets)."""
+
+    def __init__(self, image, origin_widget, offset=None):
+        self.image = image                       # QImage, device pixels, with its pixel ratio set
+        self.origin = origin_widget              # coordinates are taken in this widget ...
+        self.offset = offset or QPoint(0, 0)     # ... and this point of it is the image's (0, 0)
+        self._version = id(image)
+
+    def version(self):
+        return self._version
+
+    def scene(self):
+        return self.image
+
+
+class GlassMixin:
+    """Paints a glass body. The widget sets self.glass_kind and, unless it sits
+    directly on the canvas, self.glass_source (a StaticSource)."""
+
+    glass_kind = "panel"
+    glass_source = None
+
+    def _glass_host(self):
+        if self.glass_source is not None:
+            return self.glass_source
+        win = self.window()
+        return getattr(win, "canvas", None)
+
+    def paint_glass(self, p, rect, kind=None, tint=None):
+        kind = kind or self.glass_kind
+        spec = GLASS_KINDS[kind]
+        host = self._glass_host()
+        path = rounded(rect, spec["r"])
+        alpha = glass_tint(kind) if tint is None else tint
+        img = None
+        if host is not None:
+            dpr = max(1.0, self.devicePixelRatioF())
+            origin = getattr(host, "origin", None) or self.window()
+            top_left = self.mapTo(origin, rect.topLeft().toPoint()) if origin is not self else rect.topLeft().toPoint()
+            top_left -= getattr(host, "offset", QPoint(0, 0))
+            dev = QRect(int(round(top_left.x() * dpr)), int(round(top_left.y() * dpr)),
+                        int(round(rect.width() * dpr)), int(round(rect.height() * dpr)))
+            key = (host.version(), dev.x(), dev.y(), dev.width(), dev.height(), kind, APPEARANCE_VERSION[0],
+                   round(alpha, 4))
+            if getattr(self, "_glass_key", None) != key:
+                img = make_glass(host.scene(), dev, kind, dpr)
+                if img is not None:              # the tint is baked in: one fill per paint
+                    q = QPainter(img)
+                    q.drawImage(0, 0, _tint_image(img.width(), img.height(), dpr, spec["r"], spec["fe"],
+                                                  int(round(alpha * 1000))))
+                    q.end()
+                self._glass_img = img
+                self._glass_key = key
+            img = self._glass_img
+        if img is not None:
+            brush = QBrush(img)
+            brush.setTransform(QTransform.fromTranslate(rect.x(), rect.y()))
+            p.fillPath(path, brush)
+        else:
+            p.fillPath(path, rgba(30, 30, 34, 0.9))
+            paint_tint(p, rect, spec["r"], alpha, spec["fe"])
+        return path
+
+
+class GlassPanel(GlassMixin, QFrame):
+    """A floating glass surface: the side panels, the top bar groups, the filmstrip."""
+
+    def __init__(self, kind="panel", parent=None):
+        super().__init__(parent)
+        self.glass_kind = kind
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
+    def glass_rect(self):
+        return QRectF(self.rect())
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.paint_glass(p, self.glass_rect())
+        p.end()
 
 
 # ---------------------------------------------------------------------
 # Small reusable widgets
 # ---------------------------------------------------------------------
 
-class Switch(QAbstractButton):
-    """An on/off pill switch."""
+class SLabel(QLabel):
+    """A label for glass: plain text with a faint 1 px shadow so it reads over
+    bright parts of the picture. Style: 'text', 'muted', 'note', 'cap', 'title',
+    'hud', 'dim', 'mono'."""
 
-    def __init__(self, checked=False, parent=None):
+    STYLES = {
+        "text": (12.5, None, TEXT, 0.4),
+        "muted": (12.0, None, MUTED, 0.4),
+        "note": (11.5, None, MUTED, 0.35),
+        "cap": (12.0, 600, TEXT, 0.4),
+        "title": (14.0, 600, TEXT, 0.4),
+        "h1": (16.0, 600, TEXT, 0.4),
+        "hud": (12.0, 500, "#ffffff", 0.6),
+        "hudb": (12.0, 600, "#ffffff", 0.6),
+        "dim": (12.0, 400, "#ffffffbd", 0.6),
+        "app": (12.0, 600, "#ffffffb3", 0.6),
+        "mono": (11.0, None, MUTED, 0.35),
+        "accent": (12.0, 500, None, 0.6),
+    }
+
+    def __init__(self, text="", style="text", wrap=None, parent=None):
+        super().__init__(text, parent)
+        self._style = style
+        size, weight, colour, shadow = self.STYLES[style]
+        self.setFont(ui_font(size, weight, mono=style == "mono"))
+        self._colour = colour
+        self._shadow = shadow
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(style in ("note", "muted") if wrap is None else wrap)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        if style == "note":
+            self.setContentsMargins(0, 2, 0, 4)
+        self.hide_when_empty = False
+
+    def setText(self, text):
+        super().setText(text)
+        if self.hide_when_empty:
+            self.setVisible(bool(text))
+
+    def set_colour(self, colour):
+        self._colour = colour
+        self.update()
+
+    def colour(self):
+        if self._colour is None:
+            return accent()
+        c = QColor(self._colour)
+        if not self.isEnabled():
+            c.setAlphaF(c.alphaF() * 0.45)
+        return c
+
+    def paintEvent(self, _event):
+        text = self.text()
+        if not text:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        r = QRectF(self.contentsRect())
+        flags = int(self.alignment())
+        if self.wordWrap():
+            flags |= int(Qt.TextFlag.TextWordWrap)
+        elif not (self.alignment() & Qt.AlignmentFlag.AlignRight):
+            fm = QFontMetricsF(self.font())
+            if "\n" not in text:
+                text = fm.elidedText(text, Qt.TextElideMode.ElideRight, r.width())
+        if self._style == "mono":
+            flags |= int(Qt.TextFlag.TextExpandTabs)
+        p.setFont(self.font())
+        if self._shadow:
+            p.setPen(black(self._shadow))
+            p.drawText(r.translated(0, 1), flags, text)
+        p.setPen(self.colour())
+        p.drawText(r, flags, text)
+        p.end()
+
+
+class PressMixin:
+    """Jelly press feedback: squash quickly on press, wobble back on release."""
+
+    press_scale = (0.84, 0.84)
+
+    def _init_press(self):
+        self._sd = SpringDriver(self.update)
+        self._sx = self._sd.spring(1.0, 440, 13, 0.001)
+        self._sy = self._sd.spring(1.0, 440, 13, 0.001)
+        self._hover = False
+
+    def _press(self, down):
+        if down:
+            self._sx.set(self.press_scale[0], 2600, 95)
+            self._sy.set(self.press_scale[1], 2600, 95)
+        else:
+            self._sx.set(1.0, 440, 13)
+            self._sy.set(1.0, 440, 13)
+        self._sd.kick()
+
+    def _apply_press(self, p, rect):
+        sx, sy = self._sx.x, self._sy.x
+        if abs(sx - 1) > 1e-3 or abs(sy - 1) > 1e-3:
+            c = rect.center()
+            p.translate(c)
+            p.scale(sx, sy)
+            p.translate(-c)
+
+
+class GlassButton(PressMixin, QAbstractButton):
+    """Every push button. kind: 'tb' (top bar), 'btn' (raised), 'flat', 'pri'
+    (accent), 'ib' (small icon button), 'cap' / 'capx' (window caption), 'pre'
+    (preset list), 'seg' is drawn by SegmentedControl instead."""
+
+    def __init__(self, text="", icon=None, kind="btn", tip="", checkable=False, parent=None):
         super().__init__(parent)
-        self.setCheckable(True)
-        self.setChecked(bool(checked))
-        self.setFixedSize(40, 22)
+        self.kind = kind
+        self._icon = icon
+        self.idle = False                   # 'ib' only: dimmed while there is nothing to do
+        self.setText(text)
+        self.setCheckable(checkable)
+        if tip:
+            self.setToolTip(tip)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.press_scale = {"btn": (0.95, 0.88), "pri": (0.975, 0.9), "pre": (0.94, 0.94),
+                            "flat": (0.95, 0.88)}.get(kind, (0.84, 0.84))
+        self._init_press()
+        size = 13.0 if kind in ("pri", "app") else (12.5 if kind in ("tb", "btn", "flat", "pre") else 12.0)
+        self.setFont(ui_font(size, 600 if kind in ("pri", "app") else 500))
+        self.icon_size = None               # overrides the kind's icon size
+        self.pressed.connect(lambda: self._press(True))
+        self.released.connect(lambda: self._press(False))
+        self.label_visible = True
+        self.updateGeometry()
+
+    def set_icon(self, name):
+        self._icon = name
+        self.updateGeometry()
+        self.update()
+
+    def set_idle(self, idle):
+        if self.idle != bool(idle):
+            self.idle = bool(idle)
+            self.update()
+
+    def set_label_visible(self, on):
+        if self.label_visible != bool(on):
+            self.label_visible = bool(on)
+            self.updateGeometry()
+            self.update()
+
+    def _metrics(self):
+        h, pad, icon = self._kind_metrics()
+        return h, pad, (self.icon_size or icon)
+
+    def _kind_metrics(self):
+        k = self.kind
+        if k in ("tb", "app"):
+            return 30, 8, 16
+        if k == "ib":
+            return 24, 0, 13
+        if k in ("cap", "capx"):
+            return 32, 0, 10
+        if k == "pri":
+            return 36, 14, 16
+        if k == "pre":
+            return 30, 10, 14
+        return 28, 11, 14
 
     def sizeHint(self):
-        return QSize(40, 22)
+        h, pad, icon = self._metrics()
+        if self.kind in ("cap", "capx"):
+            return QSize(46, 32)
+        if self.kind == "ib":
+            return QSize(24, 24)
+        fm = QFontMetricsF(self.font())
+        text = self.text() if self.label_visible else ""
+        if self.kind == "tb":
+            if not text:
+                return QSize(32 if self._icon else 26, h)
+            if not self._icon and len(text) <= 1:
+                return QSize(26, h)
+        w = pad * 2
+        if self._icon:
+            w += icon
+        if text:
+            w += fm.horizontalAdvance(text) + (6 if self._icon else 0)
+        return QSize(int(math.ceil(w)), h)
+
+    def minimumSizeHint(self):
+        if self.kind in ("btn", "flat", "pre"):
+            return QSize(28, self._metrics()[0])
+        return self.sizeHint()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
 
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        k = self.kind
+        r = QRectF(self.rect())
+        h, pad, isz = self._metrics()
+        body = QRectF(r.x(), (r.height() - h) / 2.0, r.width(), h) if k not in ("cap", "capx") else r
+        self._apply_press(p, body)
         on = self.isChecked()
-        track = QColor(10, 132, 255) if on else QColor(255, 255, 255, 50)
-        knob = QColor(255, 255, 255)
-        if not self.isEnabled():
-            track.setAlpha(60)
-            knob.setAlpha(120)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(track)
-        p.drawRoundedRect(QRectF(0.0, 0.0, 40.0, 22.0), 11.0, 11.0)
-        p.setBrush(knob)
-        p.drawEllipse(QRectF(20.0 if on else 2.0, 2.0, 18.0, 18.0))
+        enabled = self.isEnabled()
+        hover = self._hover and enabled
+        down = self.isDown()
+        radius = {"tb": 8.0, "app": 8.0, "ib": 6.0, "pri": 11.0, "pre": 7.0, "cap": 0.0, "capx": 0.0}.get(k, 7.0)
+        path = rounded(body, radius)
+        fg = QColor("#ffffff")
+        shadow_text = 0.0
+        if k == "app":
+            shadow_text = 0.6
+            if hover or down:
+                p.fillPath(path, white(0.14))
+        elif k == "tb":
+            shadow_text = 0.6
+            if on:
+                paint_small_shadow(p, path, 2.0, 0.4)
+                g = QLinearGradient(body.topLeft(), body.bottomLeft())
+                g.setColorAt(0, white(0.36))
+                g.setColorAt(1, white(0.18))
+                p.fillPath(path, QBrush(g))
+            elif hover:
+                p.fillPath(path, white(0.14))
+        elif k == "btn":
+            fg = QColor("#f4f4f6")
+            if enabled:
+                paint_small_shadow(p, path, 1.0, 0.4)
+            g = QLinearGradient(body.topLeft(), body.bottomLeft())
+            hi = 0.22 if hover else 0.15
+            g.setColorAt(0, white(hi if enabled else 0.08))
+            g.setColorAt(1, white(hi - 0.08 if enabled else 0.04))
+            p.fillPath(path, QBrush(g))
+            if on:
+                p.fillPath(path, accent(0.35))
+            p.save()
+            p.setClipPath(path)
+            p.setPen(QPen(white(0.14 if not down else 0.0), 1.0))
+            p.drawLine(QPointF(body.x() + radius, body.y() + 0.5), QPointF(body.right() - radius, body.y() + 0.5))
+            p.restore()
+        elif k == "flat":
+            fg = QColor("#ffffff" if hover else "#d8d8de")
+            if on:
+                p.fillPath(path, white(0.14))
+            elif hover:
+                p.fillPath(path, white(0.09))
+        elif k == "pri":
+            fg = QColor("#06131c")
+            a = accent()
+            if not enabled:
+                a.setAlphaF(0.35)
+                fg = QColor(6, 19, 28, 140)
+            else:
+                glow = rounded(body.adjusted(4, 6, -4, 2), radius)
+                for i, al in ((3, 0.10), (2, 0.12), (1, 0.14)):
+                    p.fillPath(rounded(body.adjusted(-i * 1.5 + 4, i * 2.0, i * 1.5 - 4, i * 2.5), radius),
+                               QColor(a.red(), a.green(), a.blue(), int(255 * al)))
+                paint_small_shadow(p, glow, 2.0, 0.35)
+            if hover and enabled:
+                a = a.lighter(107)
+            p.fillPath(path, a)
+            g = QLinearGradient(body.topLeft(), body.bottomLeft())
+            g.setColorAt(0, white(0.34))
+            g.setColorAt(0.54, white(0.0))
+            p.fillPath(path, QBrush(g))
+            p.save()
+            p.setClipPath(path)
+            p.setPen(QPen(white(0.5), 1.0))
+            p.drawLine(QPointF(body.x() + radius, body.y() + 0.5), QPointF(body.right() - radius, body.y() + 0.5))
+            p.restore()
+        elif k == "ib":
+            fg = QColor("#ffffff" if hover or on else "#d0d0d6")
+            if on:
+                p.fillPath(path, white(0.16))
+            elif hover:
+                p.fillPath(path, white(0.12))
+            if self.idle and not hover:
+                p.setOpacity(0.34)
+        elif k in ("cap", "capx"):
+            shadow_text = 0.7
+            if hover:
+                p.fillRect(body, QColor("#c42b1c") if k == "capx" else white(0.14))
+        elif k == "pre":
+            fg = QColor("#ffffff" if on else "#e4e4e8")
+            if on:
+                paint_small_shadow(p, path, 2.0, 0.4)
+                g = QLinearGradient(body.topLeft(), body.bottomLeft())
+                g.setColorAt(0, white(0.22))
+                g.setColorAt(1, white(0.12))
+                p.fillPath(path, QBrush(g))
+            elif hover:
+                p.fillPath(path, white(0.08))
+        if not enabled and k not in ("pri",):
+            fg.setAlphaF(0.42)
+        text = self.text() if self.label_visible else ""
+        if k in ("cap", "capx"):
+            self._paint_caption(p, body, fg)
+        else:
+            fm = QFontMetricsF(self.font())
+            tw = fm.horizontalAdvance(text) if text else 0.0
+            iw = isz if self._icon else 0.0
+            gap = 6.0 if (text and self._icon) else 0.0
+            if k == "pre":
+                x = body.x() + pad
+            else:
+                x = body.x() + (body.width() - (tw + iw + gap)) / 2.0
+            if self._icon:
+                draw_icon(p, self._icon, QRectF(x, body.center().y() - iw / 2.0, iw, iw), fg,
+                          shadow=k in ("tb", "app"))
+                x += iw + gap
+            if text:
+                if k == "pre" and on:
+                    p.setFont(ui_font(12.5, 600))
+                else:
+                    p.setFont(self.font())
+                tr = QRectF(x, body.y(), body.right() - x - (pad if k == "pre" else 0), body.height())
+                al = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+                shown = fm.elidedText(text, Qt.TextElideMode.ElideRight, max(10.0, tr.width() + 1))
+                draw_text(p, tr, int(al), shown, fg, shadow_text or (0.4 if k in ("btn", "flat", "pre") else 0))
+        if self.hasFocus() and k not in ("cap", "capx"):
+            p.setOpacity(1.0)
+            p.setPen(QPen(accent(), 2.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(rounded(body.adjusted(1, 1, -1, -1), radius))
         p.end()
+
+    def _paint_caption(self, p, r, fg):
+        """Windows caption glyphs: 10 px, 1 px lines."""
+        dpr = max(1.0, self.devicePixelRatioF())
+        c = r.center()
+        s = 5.0
+        pen = QPen(black(0.55), 1.0 / dpr * max(1.0, round(dpr)))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        for off, col in ((1.0, black(0.55)), (0.0, fg)):
+            pen.setColor(col)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            cx, cy = c.x(), c.y() + off
+            if self._icon == "min":
+                p.drawLine(QPointF(cx - s, cy), QPointF(cx + s, cy))
+            elif self._icon == "max":
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p.drawRoundedRect(QRectF(cx - s + 0.5, cy - s + 0.5, 2 * s - 1, 2 * s - 1), 1.5, 1.5)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            elif self._icon == "restore":
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p.drawRoundedRect(QRectF(cx - s + 0.5, cy - s + 2.5, 2 * s - 3, 2 * s - 3), 1.2, 1.2)
+                p.drawLine(QPointF(cx - s + 2.5, cy - s + 0.5), QPointF(cx + s - 1.5, cy - s + 0.5))
+                p.drawLine(QPointF(cx + s - 0.5, cy - s + 1.5), QPointF(cx + s - 0.5, cy + s - 2.5))
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            else:
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy + s))
+                p.drawLine(QPointF(cx + s, cy - s), QPointF(cx - s, cy + s))
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+
+class Switch(PressMixin, QAbstractButton):
+    """An on/off switch whose knob lands like a drop of water. small=True is the
+    neutral 26 x 15 switch that turns a Develop section on and off."""
+
+    def __init__(self, checked=False, parent=None, small=False):
+        super().__init__(parent)
+        self.small = small
+        self.setCheckable(True)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._init_press()
+        self._drv = SpringDriver(self.update, on_step=self._step_blob)
+        self._pos = self._drv.spring(1.0 if checked else 0.0, 300, 20, 0.002)
+        self._blob = 1.0                         # 0..1 progress of the landing wobble
+        self._user = False
+        self.setChecked(bool(checked))
+        self._pos.snap(1.0 if checked else 0.0)
+        w, h = (26, 15) if small else (36, 20)
+        self.setFixedSize(w, h)
+        self.pressed.connect(lambda: self.update())
+        self.released.connect(lambda: self.update())
+
+    def sizeHint(self):
+        return QSize(26, 15) if self.small else QSize(36, 20)
+
+    def nextCheckState(self):
+        self._user = True
+        super().nextCheckState()
+
+    def checkStateSet(self):
+        super().checkStateSet()
+        target = 1.0 if self.isChecked() else 0.0
+        if self._user and motion_on():
+            self._pos.set(target)
+            self._blob = 0.0
+            self._drv.hold = self._blob_running
+            self._drv.kick()
+        else:
+            self._pos.snap(target)
+            self._blob = 1.0
+            self.update()
+        self._user = False
+
+    def _blob_running(self):
+        return self._blob < 1.0
+
+    def _step_blob(self, dt):
+        if self._blob < 1.0:
+            self._blob = min(1.0, self._blob + dt / 0.6)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        track = QRectF(0, 0, W, H)
+        path = rounded(track, H / 2.0)
+        t = min(1.2, max(-0.2, self._pos.x))
+        tf = min(1.0, max(0.0, t))
+        enabled = self.isEnabled()
+        off_col = black(0.42)
+        on_col = white(0.46) if self.small else accent()
+        col = QColor(
+            int(off_col.red() + (on_col.red() - off_col.red()) * tf),
+            int(off_col.green() + (on_col.green() - off_col.green()) * tf),
+            int(off_col.blue() + (on_col.blue() - off_col.blue()) * tf))
+        col.setAlphaF(off_col.alphaF() + (on_col.alphaF() - off_col.alphaF()) * tf)
+        if not enabled:
+            p.setOpacity(0.45)
+        p.fillPath(path, col)
+        p.save()
+        p.setClipPath(path)
+        p.setPen(QPen(black(0.45 - 0.2 * tf), 2.0))
+        p.drawLine(QPointF(H / 2, 0.6), QPointF(W - H / 2, 0.6))
+        p.restore()
+        k = H - 4.0
+        down = self.isDown()
+        kw = k + (4.0 if not self.small else 2.0) * (1.0 if down else 0.0)
+        travel = W - 4.0 - kw
+        x = 2.0 + travel * t
+        if down and self.isChecked():
+            x = 2.0 + travel * t
+        sx, sy = jello_scale(self._blob) if self._blob < 1.0 else (1.0, 1.0)
+        kr = QRectF(x, 2.0, kw, k)
+        c = kr.center()
+        p.translate(c)
+        p.scale(sx, sy)
+        p.translate(-c)
+        knob = rounded(kr, k / 2.0)
+        paint_small_shadow(p, knob, 1.0, 0.6)
+        p.fillPath(knob, QColor("#f6f6f8"))
+        p.end()
+        if self.hasFocus():
+            q = QPainter(self)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            q.setPen(QPen(accent(), 1.5))
+            q.drawPath(rounded(track.adjusted(0.75, 0.75, -0.75, -0.75), H / 2.0))
+            q.end()
 
 
 class SwitchRow(QWidget):
     """A label with a switch on the right; clicking the label toggles it too."""
     toggled = Signal(bool)
 
-    def __init__(self, text, checked=False, tip=""):
+    def __init__(self, text, checked=False, tip="", style="text"):
         super().__init__()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.label = QLabel(text)
-        self.label.setWordWrap(True)
+        lay.setSpacing(10)
+        self.label = SLabel(text, style, wrap=True)
         self.switch = Switch(checked)
         lay.addWidget(self.label, 1)
-        lay.addWidget(self.switch, 0)
+        lay.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.setMinimumHeight(30)
         self.switch.toggled.connect(self.toggled.emit)
         if tip:
             self.setToolTip(tip)
@@ -5348,16 +6294,296 @@ class SwitchRow(QWidget):
 
     def mouseReleaseEvent(self, _event):
         if self.isEnabled():
-            self.switch.toggle()
+            self.switch.click()
+
+
+class MicroSlider(QWidget):
+    """The 3 px slider with a droplet knob. The knob is driven by a spring, so it
+    lags, overshoots and settles; it stretches with speed, swells while held and
+    trails a small bead that merges back into it. Positions are 0..n like QSlider.
+    style: '' (accent fill from the left), 'centered' (fill from a notch at zero),
+    'temp' / 'tint' (colour tracks), 'zoom' (white fill)."""
+    valueChanged = Signal(int)
+    sliderPressed = Signal()
+    sliderReleased = Signal()
+
+    def __init__(self, n=100, style="", parent=None):
+        super().__init__(parent)
+        self._n = max(1, int(n))
+        self._pos = 0
+        self._style = style
+        self._down = False
+        self._hover = False
+        self.setMinimumHeight(20)
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._drv = SpringDriver(self.update)
+        self._kx = self._drv.spring(0.0, 560, 19, 0.05)
+        self._tx = self._drv.spring(0.0, 150, 13, 0.05)
+        self._q = self._drv.spring(1.0, 430, 11, 0.003)
+        self._placed = False
+
+    def sizeHint(self):
+        return QSize(120, 20)
+
+    def setRange(self, lo, hi):
+        self._n = max(1, int(hi) - int(lo))
+        self._pos = min(self._pos, self._n)
+        self._place(animate=False)
+
+    def maximum(self):
+        return self._n
+
+    def value(self):
+        return self._pos
+
+    def isSliderDown(self):
+        return self._down
+
+    def set_style(self, style):
+        self._style = style
+        self.update()
+
+    def _x_for(self, pos):
+        return 5.5 + (pos / float(self._n)) * max(1.0, self.width() - 11.0)
+
+    def _place(self, animate=True):
+        target = self._x_for(self._pos)
+        self._kx.target = target
+        self._tx.target = target
+        if not animate or not self._placed or not motion_on() or not self.isVisible():
+            self._kx.snap()
+            self._tx.snap()
+            self._placed = self.width() > 20
+            self.update()
+        else:
+            self._drv.kick()
+
+    def setValue(self, pos, animate=False):
+        pos = int(min(max(int(pos), 0), self._n))
+        changed = pos != self._pos
+        self._pos = pos
+        self._place(animate=animate)
+        if changed:
+            self.valueChanged.emit(pos)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._placed = False
+        self._place(animate=False)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._placed = False
+        self._place(animate=False)
+
+    def _pos_at(self, x):
+        f = (x - 5.5) / max(1.0, self.width() - 11.0)
+        return int(round(min(max(f, 0.0), 1.0) * self._n))
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton or not self.isEnabled():
+            return
+        self._down = True
+        self._q.set(1.22)
+        self.sliderPressed.emit()
+        self.setValue(self._pos_at(e.position().x()), animate=True)
+        self._drv.hold = lambda: self._down
+        self._drv.kick()
+
+    def mouseMoveEvent(self, e):
+        if self._down:
+            self.setValue(self._pos_at(e.position().x()), animate=True)
+
+    def mouseReleaseEvent(self, e):
+        if self._down:
+            self._down = False
+            self._q.set(1.0)
+            self._drv.hold = None
+            self._drv.kick()
+            self.sliderReleased.emit()
+
+    def mouseDoubleClickEvent(self, e):
+        parent = self.parent()
+        handler = getattr(parent, "reset_to_default", None)
+        if handler is not None and self.isEnabled():
+            handler()
+
+    def wheelEvent(self, e):
+        e.ignore()                               # scrolling the panel must never move a slider
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        step = max(1, self._n // 100)
+        moves = {Qt.Key.Key_Left: -step, Qt.Key.Key_Down: -step, Qt.Key.Key_Right: step, Qt.Key.Key_Up: step,
+                 Qt.Key.Key_PageDown: -max(1, self._n // 10), Qt.Key.Key_PageUp: max(1, self._n // 10)}
+        if key in moves:
+            self.setValue(self._pos + moves[key], animate=True)
+        elif key == Qt.Key.Key_Home:
+            self.setValue(0, animate=True)
+        elif key == Qt.Key.Key_End:
+            self.setValue(self._n, animate=True)
+        else:
+            super().keyPressEvent(e)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        cy = H / 2.0
+        if not self.isEnabled():
+            p.setOpacity(0.45)
+        track = QRectF(0.0, cy - 1.5, W, 3.0)
+        tpath = rounded(track, 1.5)
+        st = self._style
+        kx = self._kx.x
+        if st in ("temp", "tint"):
+            g = QLinearGradient(track.topLeft(), track.topRight())
+            stops = (("#3F86FF", "#EDEDED", "#FFB13B") if st == "temp" else ("#34C759", "#EDEDED", "#E24FD8"))
+            for i, s in enumerate(stops):
+                g.setColorAt(i / 2.0, QColor(s))
+            p.fillPath(tpath, QBrush(g))
+        else:
+            p.fillPath(tpath, white(0.36) if st == "zoom" else white(0.2))
+            fill = QColor("#ffffff") if st == "zoom" else accent()
+            if st == "centered":
+                mid = W / 2.0
+                a, b = sorted((mid, kx))
+                if b - a > 0.5:
+                    p.fillRect(QRectF(a, cy - 1.5, b - a, 3.0), fill)
+            else:
+                if kx > 0.5:
+                    p.save()
+                    p.setClipRect(QRectF(0, 0, kx, H))
+                    p.fillPath(tpath, fill)
+                    p.restore()
+        if st in ("centered", "temp", "tint"):
+            p.fillRect(QRectF(W / 2.0 - 0.5, cy - 4.5, 1.0, 9.0), white(0.5))
+        # the droplet and its trailing bead
+        q = self._q.x
+        stretch = min(0.42, abs(self._kx.v) / 1000.0)
+        sx, sy = q * (1.0 + stretch), q / (1.0 + stretch * 0.7)
+        tx = self._tx.x
+        kr, br = 5.5, 4.0
+        if self._hover or self._down:
+            halo = white(0.14 if not self._down else 0.18)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(halo)
+            p.drawEllipse(QPointF(kx, cy), kr * sx + 4.0, kr * sy + 4.0)
+        drop = QPainterPath()
+        drop.addEllipse(QPointF(kx, cy), kr * sx, kr * sy)
+        gap = abs(kx - tx)
+        if gap > 0.6:
+            bead = QPainterPath()
+            bead.addEllipse(QPointF(tx, cy), br, br)
+            drop = drop.united(bead)
+            if gap < 15.0:                           # the bridge that makes them one drop
+                neck = max(0.6, br * (1.0 - gap / 15.0) * 1.2)
+                a, b = (tx, kx) if tx < kx else (kx, tx)
+                bridge = QPainterPath()
+                bridge.moveTo(a, cy - br * 0.95)
+                bridge.quadTo((a + b) / 2.0, cy - neck, b, cy - kr * sy * 0.95)
+                bridge.lineTo(b, cy + kr * sy * 0.95)
+                bridge.quadTo((a + b) / 2.0, cy + neck, a, cy + br * 0.95)
+                bridge.closeSubpath()
+                drop = drop.united(bridge)
+        paint_small_shadow(p, drop, 1.0, 0.65)
+        p.fillPath(drop, QColor("#f6f6f8"))
+        if self.hasFocus():
+            p.setPen(QPen(accent(), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(kx, cy), kr * sx + 2.5, kr * sy + 2.5)
+        p.end()
+
+
+class ValueEdit(QLineEdit):
+    """The number at the end of a slider row: plain text until clicked, then a box to type in."""
+    edited = Signal(float)
+
+    def __init__(self, decimals=0, suffix="", width=56):
+        super().__init__()
+        self._decimals = int(decimals)
+        self._suffix = suffix
+        self._value = 0.0
+        self._special = None
+        self.setObjectName("val")
+        self.setFixedWidth(width)
+        self.setFixedHeight(22)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setFont(ui_font(12.0))
+        self.setToolTip("Click to type a value")
+        self.editingFinished.connect(self._finish)
+
+    def set_suffix(self, suffix):
+        self._suffix = suffix
+        self.set_value(self._value)
+
+    def text_for(self, v):
+        if self._special is not None and abs(v - self._special[0]) < 1e-9:
+            return self._special[1]
+        s = f"{v:.{self._decimals}f}"
+        if s.startswith("-") and float(s) == 0:
+            s = s[1:]
+        return s + self._suffix
+
+    def set_value(self, v):
+        self._value = float(v)
+        if not self.hasFocus():
+            self.setText(self.text_for(self._value))
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self.setText(f"{self._value:.{self._decimals}f}".rstrip("0").rstrip(".") if self._decimals else
+                     f"{self._value:.0f}")
+        QTimer.singleShot(0, self.selectAll)
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self.setText(self.text_for(self._value))
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.setText(self.text_for(self._value))
+            self.clearFocus()
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._finish()
+            self.clearFocus()
+            return
+        super().keyPressEvent(e)
+
+    def _finish(self):
+        raw = self.text().strip().replace(",", ".")
+        for s in (self._suffix.strip(), "%", "K", "EV", "°", "dB", "px"):
+            if s and raw.endswith(s):
+                raw = raw[: -len(s)].strip()
+        try:
+            v = float(raw)
+        except ValueError:
+            self.setText(self.text_for(self._value) if not self.hasFocus() else self.text())
+            return
+        if abs(v - self._value) > 1e-9:
+            self.edited.emit(v)
 
 
 class ParamSlider(QWidget):
-    """Title + editable number on one line, slider underneath.
-    Double-click the title to return to the default value."""
+    """One row: name, micro slider, number. Double-click the name (or the
+    slider) to return to the default; click the number to type one."""
     changed = Signal(float)
 
     def __init__(self, title, lo, hi, default, step=1.0, decimals=0, suffix="", style="",
-                 to_value=None, to_frac=None, positions=None, tip=""):
+                 to_value=None, to_frac=None, positions=None, tip="", label_width=96, value_width=62):
         super().__init__()
         self._lo, self._hi, self._default, self._step = float(lo), float(hi), float(default), float(step)
         self._to_value, self._to_frac = to_value, to_frac
@@ -5365,39 +6591,37 @@ class ParamSlider(QWidget):
         self._value = float(default)
         self._busy = False
 
-        lay = QVBoxLayout(self)
+        lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(3)
-        top = QHBoxLayout()
-        self.title = QLabel(title)
-        self.spin = QDoubleSpinBox()
-        self.spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.spin.setDecimals(int(decimals))
-        self.spin.setRange(self._lo, self._hi)
-        self.spin.setSingleStep(self._step)
-        self.spin.setSuffix(suffix)
-        self.spin.setKeyboardTracking(False)
-        self.spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.spin.setFixedWidth(84)
-        top.addWidget(self.title, 1)
-        top.addWidget(self.spin, 0)
-        lay.addLayout(top)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, self._n)
-        if style:
-            self.slider.setObjectName(style)
-        lay.addWidget(self.slider)
-        self.setToolTip(tip or "Double-click the name to reset")
+        lay.setSpacing(10)
+        self.title = SLabel(title, "text", wrap=False)
+        self.title.setFixedWidth(label_width)
+        self.title.setToolTip("Double-click to reset")
+        self.slider = MicroSlider(self._n, style)
+        self.slider.setParent(self)
+        self.spin = ValueEdit(decimals, suffix, value_width)
+        lay.addWidget(self.title, 0)
+        lay.addWidget(self.slider, 1)
+        lay.addWidget(self.spin, 0)
+        self.setMinimumHeight(30)
+        if tip:
+            self.slider.setToolTip(tip)
+            self.title.setToolTip(tip + "\nDouble-click to reset.")
 
         self.set_value(default)
         self.slider.valueChanged.connect(self._slider_moved)
-        self.spin.valueChanged.connect(self._spin_edited)
+        self.spin.edited.connect(self._typed)
 
     def value(self):
         return self._value
 
     def is_dragging(self):
         return self.slider.isSliderDown()
+
+    def set_special(self, value, text):
+        """Show `text` instead of the number at `value` (e.g. 'Off')."""
+        self.spin._special = (float(value), text)
+        self.spin.set_value(self._value)
 
     def set_range(self, lo, hi, suffix=None):
         """New limits (for a linear slider) without emitting `changed`."""
@@ -5407,9 +6631,8 @@ class ParamSlider(QWidget):
         self._busy = True
         try:
             self.slider.setRange(0, self._n)
-            self.spin.setRange(self._lo, self._hi)
             if suffix is not None:
-                self.spin.setSuffix(suffix)
+                self.spin.set_suffix(suffix)
         finally:
             self._busy = False
         self.set_value(self._value)
@@ -5430,60 +6653,167 @@ class ParamSlider(QWidget):
         self._value = v
         self._busy = True
         try:
-            self.slider.setValue(int(round(self._frac(v) * self._n)))
-            self.spin.setValue(v)
+            self.slider.setValue(int(round(self._frac(v) * self._n)), animate=self.isVisible())
+            self.spin.set_value(v)
         finally:
             self._busy = False
         if emit:
             self.changed.emit(v)
 
+    def reset_to_default(self):
+        if self.isEnabled():
+            self.set_value(self._default, emit=True)
+
     def _slider_moved(self, pos):
         if self._busy:
             return
         self._value = self._from_frac(pos / float(self._n))
-        self._busy = True
-        try:
-            self.spin.setValue(self._value)
-        finally:
-            self._busy = False
+        self.spin.set_value(self._value)
         self.changed.emit(self._value)
 
-    def _spin_edited(self, v):
-        if self._busy:
+    def _typed(self, v):
+        self.set_value(round(v / self._step) * self._step if self._step else v, emit=True)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.title.geometry().contains(event.position().toPoint()):
+            self.reset_to_default()
+
+
+class SegmentedControl(QWidget):
+    """A row of choices with one highlight that slides (and wobbles) to the chosen one."""
+    changed = Signal(object)
+
+    def __init__(self, items, current=None, parent=None):
+        super().__init__(parent)
+        self._items = list(items)                     # [(label, key)]
+        self._i = 0
+        if current is not None:
+            self._i = max(0, [k for _, k in self._items].index(current)) if current in [k for _, k in self._items] else 0
+        self._hover = -1
+        self._down = -1
+        self.setFixedHeight(28)
+        self.setMinimumWidth(60)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setMouseTracking(True)
+        self._drv = SpringDriver(self.update)
+        self._x = self._drv.spring(float(self._i), 200, 17, 0.002)
+        self._sq = self._drv.spring(1.0, 440, 13, 0.001)
+        self.setFont(ui_font(12.0))
+
+    def key(self):
+        return self._items[self._i][1] if self._items else None
+
+    def index(self):
+        return self._i
+
+    def set_key(self, key, emit=False, animate=None):
+        keys = [k for _, k in self._items]
+        if key not in keys:
             return
-        self._value = float(v)
-        self._busy = True
-        try:
-            self.slider.setValue(int(round(self._frac(self._value) * self._n)))
-        finally:
-            self._busy = False
-        self.changed.emit(self._value)
+        i = keys.index(key)
+        self._select(i, emit, animate)
 
-    def mouseDoubleClickEvent(self, _event):
-        if self.isEnabled():
-            self.set_value(self._default, emit=True)
+    def _select(self, i, emit, animate=None):
+        changed = i != self._i
+        self._i = i
+        self._x.target = float(i)
+        if animate is None:
+            animate = self.isVisible()
+        if animate and motion_on():
+            self._drv.kick()
+        else:
+            self._x.snap()
+            self.update()
+        if changed and emit:
+            self.changed.emit(self.key())
 
+    def sizeHint(self):
+        fm = QFontMetricsF(ui_font(12.0, 600))
+        w = sum(fm.horizontalAdvance(t) + 14 for t, _ in self._items) + 4
+        return QSize(int(w), 28)
 
-def make_card(title=""):
-    frame = QFrame()
-    frame.setObjectName("card")
-    lay = QVBoxLayout(frame)
-    lay.setContentsMargins(14, 12, 14, 14)
-    lay.setSpacing(9)
-    if title:
-        label = QLabel(title.upper())
-        label.setObjectName("cardTitle")
-        lay.addWidget(label)
-    return frame, lay
+    def _seg_at(self, x):
+        n = max(1, len(self._items))
+        seg = (self.width() - 4.0) / n
+        return int(min(n - 1, max(0, (x - 2.0) // seg)))
 
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            self._down = self._seg_at(e.position().x())
+            self._sq.set(0.94, 2600, 95)
+            self._drv.kick()
 
-def muted_label(text="", mono=False):
-    label = QLabel(text)
-    label.setObjectName("mono" if mono else "muted")
-    label.setWordWrap(not mono)
-    if mono:
-        label.setTextFormat(Qt.TextFormat.PlainText)
-    return label
+    def mouseReleaseEvent(self, e):
+        if self._down >= 0:
+            i = self._seg_at(e.position().x())
+            self._down = -1
+            self._sq.set(1.0, 440, 13)
+            if i == self._seg_at(e.position().x()):
+                self._select(i, True)
+            self._drv.kick()
+
+    def mouseMoveEvent(self, e):
+        h = self._seg_at(e.position().x())
+        if h != self._hover:
+            self._hover = h
+            self.update()
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            i = self._i + (1 if e.key() == Qt.Key.Key_Right else -1)
+            if 0 <= i < len(self._items):
+                self._select(i, True)
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        if not self.isEnabled():
+            p.setOpacity(0.45)
+        outer = rounded(QRectF(0, 0, W, H), 9.0)
+        p.fillPath(outer, black(0.36))
+        p.save()
+        p.setClipPath(outer)
+        p.setPen(QPen(black(0.5), 2.0))
+        p.drawLine(QPointF(8, 0.5), QPointF(W - 8, 0.5))
+        p.restore()
+        n = max(1, len(self._items))
+        seg = (W - 4.0) / n
+        th = QRectF(2.0 + self._x.x * seg, 2.0, seg, H - 4.0)
+        c = th.center()
+        p.save()
+        if abs(self._sq.x - 1.0) > 1e-3:
+            p.translate(c)
+            p.scale(self._sq.x, self._sq.x)
+            p.translate(-c)
+        tp = rounded(th, 7.0)
+        paint_small_shadow(p, tp, 2.0, 0.5)
+        g = QLinearGradient(th.topLeft(), th.bottomLeft())
+        g.setColorAt(0, white(0.30))
+        g.setColorAt(1, white(0.16))
+        p.fillPath(tp, QBrush(g))
+        p.restore()
+        for i, (label, _key) in enumerate(self._items):
+            r = QRectF(2.0 + i * seg, 2.0, seg, H - 4.0)
+            on = i == self._i
+            col = QColor("#ffffff" if on or i == self._hover else "#d6d6dc")
+            f = ui_font(12.0, 600 if on else 400)
+            fm = QFontMetricsF(f)
+            text = fm.elidedText(label, Qt.TextElideMode.ElideRight, r.width() - 8)
+            draw_text(p, r, int(Qt.AlignmentFlag.AlignCenter), text, col, 0.4, f)
+        if self.hasFocus():
+            p.setPen(QPen(accent(), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(rounded(QRectF(0.75, 0.75, W - 1.5, H - 1.5), 9.0))
+        p.end()
 
 
 def compact(combo):
@@ -5491,119 +6821,730 @@ def compact(combo):
     entry forces the whole side panel wider than the window allows)."""
     combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(8)
+    combo.setFixedHeight(28)
+    combo.setFont(ui_font(12.5))
+    combo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
     return combo
+
+
+class NoWheelCombo(QComboBox):
+    """A combo box that leaves the mouse wheel to the panel it sits in."""
+
+    def wheelEvent(self, e):
+        if self.hasFocus() and self.view().isVisible():
+            super().wheelEvent(e)
+        else:
+            e.ignore()
+
+
+def combo_box(items=(), tip=""):
+    c = compact(NoWheelCombo())
+    for key, label in items:
+        c.addItem(label, key)
+    if tip:
+        c.setToolTip(tip)
+    return c
+
+
+def muted_label(text="", mono=False):
+    return SLabel(text, "mono" if mono else "note", wrap=not mono)
 
 
 def labelled_row(text, widget, label_width=96):
     row = QHBoxLayout()
-    label = QLabel(text)
+    row.setSpacing(10)
+    label = SLabel(text, "text", wrap=False)
     label.setFixedWidth(label_width)
     row.addWidget(label, 0)
     row.addWidget(widget, 1)
     return row
 
 
-class Histogram(QWidget):
-    """Additive RGB histogram of what is currently shown (square-root scaled)."""
-
-    def __init__(self):
-        super().__init__()
-        self.setMinimumHeight(104)
-        self._curves = None
-
-    def set_image(self, img8):
-        if img8 is None or img8.size == 0:
-            self._curves = None
+def hrow(*widgets, spacing=6, stretch=None):
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(spacing)
+    for i, w in enumerate(widgets):
+        if w is None:
+            row.addStretch(1)
         else:
-            step = max(1, int(math.sqrt(img8.shape[0] * img8.shape[1] / 250_000.0)))
-            px = img8[::step, ::step].reshape(-1, 3)
-            hist = np.stack([np.bincount(px[:, c], minlength=256)[:256] for c in range(3)]).astype(np.float64)
-            peak = max(1.0, float(hist[:, 2:254].max()))        # ignore the clipped spikes when scaling
-            self._curves = np.sqrt(np.minimum(hist / peak, 1.0))
-        self.update()
+            row.addWidget(w, (stretch or {}).get(i, 0))
+    return row
+
+
+class Card(QFrame):
+    """A shaded card inside a glass panel. Its own bottom 6 px hold its shadow,
+    so cards stacked with no spacing sit 6 px apart."""
+    SHADOW = 6
+
+    def __init__(self, parent=None, radius=11.0):
+        super().__init__(parent)
+        self.radius = radius
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
+    def body_rect(self):
+        return QRectF(0.0, 0.0, float(self.width()), float(self.height() - self.SHADOW))
 
     def paintEvent(self, _event):
-        w, h = float(self.width()), float(self.height())
+        dpr = max(1.0, self.devicePixelRatioF())
+        shade = float(APPEARANCE.get("card_shade", 8)) / 100.0
+        key = (self.width(), self.height(), dpr, shade, self.radius)
+        if getattr(self, "_bg_key", None) != key:       # drawn once per size, then reused
+            pix = QPixmap(max(1, int(math.ceil(self.width() * dpr))), max(1, int(math.ceil(self.height() * dpr))))
+            pix.setDevicePixelRatio(dpr)
+            pix.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pix)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = self.body_rect()
+            path = rounded(r, self.radius)
+            for i, a in ((4.0, 0.06), (2.5, 0.09), (1.2, 0.12)):
+                q.fillPath(rounded(r.adjusted(1.5, i, -1.5, i), self.radius), black(a))
+            q.fillPath(path, rgba(36, 36, 42, shade))
+            q.setClipPath(path)
+            q.setPen(QPen(white(0.07), 1.0))
+            q.drawLine(QPointF(r.x() + self.radius * 0.6, 0.5), QPointF(r.right() - self.radius * 0.6, 0.5))
+            q.end()
+            self._bg, self._bg_key = pix, key
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        box = QPainterPath()
-        box.addRoundedRect(QRectF(0.0, 0.0, w, h), 9.0, 9.0)
-        p.fillPath(box, QBrush(QColor(0, 0, 0, 95)))
-        p.setClipPath(box)
-        p.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
-        for i in (1, 2, 3):
-            p.drawLine(QPointF(w * i / 4.0, 0.0), QPointF(w * i / 4.0, h))
-        if self._curves is not None:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
-            for c, colour in enumerate((QColor(235, 60, 60, 215), QColor(60, 215, 90, 215), QColor(70, 120, 255, 215))):
-                path = QPainterPath()
-                path.moveTo(0.0, h)
-                for i in range(256):
-                    path.lineTo(w * i / 255.0, h - float(self._curves[c, i]) * (h - 4.0))
-                path.lineTo(w, h)
-                path.closeSubpath()
-                p.fillPath(path, QBrush(colour))
+        p.drawPixmap(0, 0, self._bg)
         p.end()
 
 
+def make_card(title="", spacing=1, margins=(12, 8, 12, 9)):
+    """A card with an optional caption; returns (card, its layout)."""
+    card = Card()
+    lay = QVBoxLayout(card)
+    l, t, r, b = margins
+    lay.setContentsMargins(l, t, r, b + Card.SHADOW)
+    lay.setSpacing(spacing)
+    if title:
+        cap = SLabel(title, "cap")
+        cap.setContentsMargins(0, 0, 0, 4)
+        lay.addWidget(cap)
+    return card, lay
+
+
+class FoldHeader(PressMixin, QWidget):
+    """The clickable part of a section header: chevron, title, summary."""
+    clicked = Signal()
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.summary = ""
+        self.open_amount = 1.0                    # 0 = closed .. 1 = open (the chevron turns)
+        self.off = False
+        self.press_scale = (0.97, 0.92)
+        self._init_press()
+        self.setFixedHeight(28)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._drv = SpringDriver(self.update)
+        self._rot = self._drv.spring(1.0, 440, 13, 0.002)
+
+    def set_open(self, on, animate=True):
+        self._rot.target = 1.0 if on else 0.0
+        if animate:
+            self._drv.kick()
+        else:
+            self._rot.snap()
+            self.update()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press(True)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press(False)
+            if self.rect().contains(e.position().toPoint()):
+                self.clicked.emit()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.clicked.emit()
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        self._apply_press(p, r)
+        if self._hover:
+            p.fillPath(rounded(r, 8.0), white(0.07))
+        # chevron, turning from right (closed) to down (open)
+        c = QPointF(r.x() + 13.0, r.center().y())
+        p.save()
+        p.translate(c)
+        p.rotate(90.0 * self._rot.x)
+        draw_icon(p, "chev_r", QRectF(-5, -5, 10, 10), QColor(MUTED))
+        p.restore()
+        x = r.x() + 26.0
+        f = ui_font(12.5, 600)
+        fm = QFontMetricsF(f)
+        tw = fm.horizontalAdvance(self.title)
+        draw_text(p, QRectF(x, r.y(), tw + 2, r.height()), int(Qt.AlignmentFlag.AlignVCenter),
+                  self.title, "#a9a9b2" if self.off else TEXT, 0.4, f)
+        if self.summary and self._rot.target < 0.5:
+            sf = ui_font(11.5)
+            sx = x + tw + 10.0
+            avail = r.right() - 8.0 - sx
+            if avail > 20:
+                text = QFontMetricsF(sf).elidedText(self.summary, Qt.TextElideMode.ElideRight, avail)
+                p.setOpacity(min(1.0, max(0.0, 1.0 - self._rot.x * 2.0)))
+                draw_text(p, QRectF(sx, r.y(), avail, r.height()),
+                          int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), text, MUTED, 0.35, sf)
+        if self.hasFocus():
+            p.setOpacity(1.0)
+            p.setPen(QPen(accent(), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(rounded(r.adjusted(1, 1, -1, -1), 8.0))
+        p.end()
+
+
+class FoldCard(Card):
+    """A Develop section: a header that folds the body open and shut (on a
+    spring, with the body wobbling into place), a reset arrow and an on/off
+    switch that bypasses the section while keeping its values."""
+    toggled_open = Signal(bool)
+    reset_clicked = Signal()
+    enabled_changed = Signal(bool)
+
+    def __init__(self, title, key, open_=True, switchable=True, resettable=True, tip=""):
+        super().__init__()
+        self.key = key
+        self._open = bool(open_)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 3, 0, Card.SHADOW)
+        outer.setSpacing(0)
+        head = QHBoxLayout()
+        head.setContentsMargins(3, 0, 10, 0)
+        head.setSpacing(5)
+        self.header = FoldHeader(title)
+        head.addWidget(self.header, 1)
+        self.btn_reset = GlassButton("", "reset", "ib", "Reset this section")
+        self.btn_reset.setVisible(resettable)
+        head.addWidget(self.btn_reset, 0)
+        self.switch = Switch(True, small=True)
+        self.switch.setToolTip(tip or "Turn this section off without losing its settings")
+        self.switch.setVisible(switchable)
+        head.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        hw = QWidget()
+        hw.setLayout(head)
+        hw.setFixedHeight(34)
+        outer.addWidget(hw)
+        self.clip = QWidget()                      # its height animates; the body inside keeps its size
+        self.clip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.body = QWidget(self.clip)
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(12, 0, 12, 9)
+        self.body_layout.setSpacing(1)
+        outer.addWidget(self.clip)
+        self._drv = SpringDriver(self._frame)
+        self._h = self._drv.spring(1.0 if open_ else 0.0, 300, 26, 0.002)
+        self._reveal = self._drv.spring(1.0, 300, 11, 0.003)       # the body's wobble as it opens
+        self._fade = 1.0
+        self._effect = None
+        self.header.clicked.connect(self.toggle)
+        self.header.set_open(self._open, animate=False)
+        self.btn_reset.clicked.connect(self.reset_clicked.emit)
+        self.switch.toggled.connect(self._switched)
+        self.body.installEventFilter(self)
+        self._apply_height()
+
+    def addWidget(self, w, stretch=0):
+        self.body_layout.addWidget(w, stretch)
+        return w
+
+    def addLayout(self, lay):
+        self.body_layout.addLayout(lay)
+        return lay
+
+    def is_open(self):
+        return self._open
+
+    def is_on(self):
+        return self.switch.isChecked()
+
+    def set_on(self, on):
+        self.switch.blockSignals(True)
+        self.switch.setChecked(bool(on))
+        self.switch.blockSignals(False)
+        self._apply_off()
+
+    def set_dirty(self, dirty):
+        self.btn_reset.set_idle(not dirty)
+
+    def set_summary(self, text):
+        if text != self.header.summary:
+            self.header.summary = text
+            self.header.update()
+
+    def _switched(self, on):
+        self._apply_off()
+        self.enabled_changed.emit(bool(on))
+
+    def _apply_off(self):
+        off = not self.switch.isChecked()
+        self.header.off = off
+        self.header.update()
+        if off and self._effect is None:
+            self._effect = QGraphicsOpacityEffect(self.body)
+            self._effect.setOpacity(0.36)
+            self.body.setGraphicsEffect(self._effect)
+        elif not off and self._effect is not None:
+            self.body.setGraphicsEffect(None)
+            self._effect = None
+
+    def set_open(self, on, animate=True):
+        on = bool(on)
+        if on == self._open:
+            return
+        self._open = on
+        self.header.set_open(on, animate)
+        self._h.target = 1.0 if on else 0.0
+        if on:
+            self._reveal.snap(0.0)
+            self._reveal.target = 1.0
+        if animate and motion_on() and self.isVisible():
+            self._drv.kick()
+        else:
+            self._h.snap()
+            self._reveal.snap(1.0)
+            self._apply_height()
+        self.toggled_open.emit(on)
+
+    def toggle(self):
+        self.set_open(not self._open)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.body and ev.type() == QEvent.Type.LayoutRequest:
+            QTimer.singleShot(0, self._apply_height)
+        return False
+
+    def _body_height(self):
+        width = max(1, self.clip.width())
+        self.body.setFixedWidth(width)
+        lay = self.body_layout
+        if lay.hasHeightForWidth():
+            return max(0, lay.heightForWidth(width))
+        return max(0, lay.sizeHint().height())
+
+    def _apply_height(self):
+        try:
+            bh = self._body_height()
+        except RuntimeError:
+            return
+        self.body.setFixedHeight(bh)
+        f = max(0.0, self._h.x)
+        h = int(round(bh * f))
+        self.clip.setFixedHeight(max(0, h))
+        # the body drops in from slightly above and squashed, then wobbles into place
+        rv = self._reveal.x
+        self.body.move(0, int(round(-10.0 * (1.0 - min(1.0, rv)))))
+        self.body.setVisible(h > 0)
+
+    def _frame(self):
+        self._apply_height()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._apply_height()
+
+
+class Veil(QWidget):
+    """Invisible layer under an open menu: a click anywhere else closes the menu."""
+    clicked = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.hide()
+
+    def mousePressEvent(self, e):
+        self.clicked.emit()
+        e.accept()
+
+    def wheelEvent(self, e):
+        self.clicked.emit()
+
+    def paintEvent(self, _e):
+        pass
+
+
+class Reveal(QWidget):
+    """Plays a widget's entrance: a still picture of it grows from one corner
+    (or slides in) with a jelly wobble, then the live widget takes over."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._drv = SpringDriver(self.update, on_done=self._done)
+        self._s = self._drv.spring(1.0, 360, 12, 0.002)
+        self._o = self._drv.spring(1.0, 420, 34, 0.004)
+        self._d = self._drv.spring(0.0, 300, 22, 0.05)
+        self._target = None
+        self._pix = None
+        self.hide()
+
+    def busy_with(self, target):
+        return self._target is target and self.isVisible()
+
+    def play(self, target, origin="tl", scale=(0.72, 0.72), offset=(0.0, 0.0), fade=True,
+             k=360.0, c=12.0):
+        """target must be laid out at its final geometry and hidden."""
+        if not motion_on() or target.width() < 2 or target.height() < 2:
+            target.show()
+            target.raise_()
+            return
+        self.finish()
+        self._pix = target.grab()
+        geo = target.geometry()
+        m = int(max(geo.width(), geo.height()) * 0.1 + max(abs(offset[0]), abs(offset[1])) + 6)
+        self.setGeometry(geo.adjusted(-m, -m, m, m))
+        self._m = m
+        self._target = target
+        self._origin = origin
+        self._scale0 = scale
+        self._off0 = offset
+        self._fade = fade
+        self._s.set(1.0, k, c)
+        self._s.snap(0.0)
+        self._s.target = 1.0
+        self._o.snap(0.0 if fade else 1.0)
+        self._o.target = 1.0
+        self.show()
+        self.raise_()
+        self._drv.kick()
+
+    def finish(self):
+        if self._target is not None:
+            self._drv.stop()
+            self._done()
+
+    def _done(self):
+        target, self._target = self._target, None
+        self._pix = None
+        self.hide()
+        if target is not None:
+            try:
+                target.show()
+                target.raise_()
+                if hasattr(target, "after_reveal"):
+                    target.after_reveal()
+            except RuntimeError:
+                pass
+
+    def paintEvent(self, _event):
+        if self._pix is None:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = self._s.x                                # 0 -> 1 with overshoot
+        sx = self._scale0[0] + (1.0 - self._scale0[0]) * t
+        sy = self._scale0[1] + (1.0 - self._scale0[1]) * t
+        dx = self._off0[0] * (1.0 - t)
+        dy = self._off0[1] * (1.0 - t)
+        m = self._m
+        w = self._pix.width() / self._pix.devicePixelRatio()
+        h = self._pix.height() / self._pix.devicePixelRatio()
+        o = self._origin
+        ox = m + (0.0 if o[-1] == "l" else w if o[-1] == "r" else w / 2.0)
+        oy = m + (0.0 if o[0] == "t" else h if o[0] == "b" else h / 2.0)
+        p.setOpacity(max(0.0, min(1.0, self._o.x)))
+        p.translate(ox + dx, oy + dy)
+        p.scale(max(0.05, sx), max(0.05, sy))
+        p.translate(-ox, -oy)
+        p.drawPixmap(QPointF(m, m), self._pix)
+        p.end()
+
+
+class Popover(GlassMixin, QFrame):
+    """A glass menu that pops open from its button with a jelly wobble.
+    origin: the corner it grows from ('tl', 'tr', 'bl', 'br' or 'c')."""
+    closed = Signal()
+
+    def __init__(self, window, width=304, title=""):
+        super().__init__(window)
+        self.glass_kind = "pop"
+        self._win = window
+        self.setFixedWidth(width)
+        self.lay = QVBoxLayout(self)
+        self.lay.setContentsMargins(12, 12, 12, 12)
+        self.lay.setSpacing(6)
+        if title:
+            self.lay.addWidget(SLabel(title, "cap"))
+        self.veil = Veil(window)
+        self.veil.clicked.connect(self.close_menu)
+        self.reveal = Reveal(window)
+        self._origin = "tl"
+        self._anchor = QPoint(0, 0)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.hide()
+
+    def is_open(self):
+        return self.isVisible() or self.reveal.busy_with(self)
+
+    def open_at(self, pos, origin="tl"):
+        """Open with its `origin` corner at pos (window coordinates)."""
+        self._anchor = QPoint(pos)
+        self._origin = origin
+        self._place()
+        win = self._win
+        self.veil.setGeometry(0, 0, win.width(), win.height())
+        self.veil.show()
+        self.veil.raise_()
+        self.refresh_backdrop()
+        self.reveal.play(self, origin, (0.72, 0.72), k=300.0, c=11.0)
+        QTimer.singleShot(0, self.setFocus)
+
+    def move_to(self, pos, origin=None):
+        """Move an open menu to a new anchor without replaying its entrance."""
+        self._anchor = QPoint(pos)
+        if origin:
+            self._origin = origin
+        if self.reveal.busy_with(self):
+            self.reveal.finish()
+        old = self.geometry()
+        self._place()
+        if self.geometry() != old:
+            self.refresh_backdrop()
+
+    def _place(self):
+        win = self._win
+        lay = self.layout()
+        lay.activate()
+        w = self.width()
+        h = lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else lay.sizeHint().height()
+        h = max(h, lay.totalMinimumSize().height())
+        self.resize(w, h)
+        x, y = self._anchor.x(), self._anchor.y()
+        o = self._origin
+        if o[-1] == "r":
+            x -= w
+        elif o == "c":
+            x -= w // 2
+        if o[0] == "b":
+            y -= h
+        elif o == "c":
+            y -= h // 2
+        x = max(6, min(x, win.width() - w - 6))
+        y = max(6, min(y, win.height() - h - 6))
+        self.move(x, y)
+
+    def refresh_backdrop(self):
+        grab = getattr(self._win, "layer_grab", None)
+        if grab is not None:
+            geo = self.geometry()
+            self.glass_source = StaticSource(grab(geo), self._win, geo.topLeft())
+        self._glass_key = None
+        self.update()
+
+    def close_menu(self):
+        self.reveal.finish()
+        if not self.isVisible():
+            return
+        self.veil.hide()
+        self.hide()
+        self.closed.emit()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close_menu()
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.paint_glass(p, QRectF(self.rect()))
+        p.end()
+
+    def event(self, ev):
+        if ev.type() == QEvent.Type.LayoutRequest and self.isVisible():
+            QTimer.singleShot(0, self._relayout)
+        return super().event(ev)
+
+    def _relayout(self):
+        if not self.isVisible():
+            return
+        old = self.geometry()
+        self._place()
+        if self.geometry() != old:
+            self.refresh_backdrop()
+
+
 # ---------------------------------------------------------------------
-# Image viewer: zoom, drag-to-pan, crop overlay, white-balance picker
+# The canvas: the picture edge to edge, zoom, drag-to-pan, crop overlay,
+# white-balance picker. It also keeps the 'scene' the glass panels bend.
 # ---------------------------------------------------------------------
 
-class ImageView(QWidget):
+class Canvas(QWidget):
     zoomChanged = Signal(float)          # percent, 100 = one screen pixel per full-res pixel
     cropChanged = Signal(object)         # (x0, y0, x1, y1) while dragging
     cropFinished = Signal()
     pointPicked = Signal(float, float)   # fractions of the displayed image
     applyRequested = Signal()            # Enter / Esc / double-click inside the crop frame
+    viewMoved = Signal()
 
     HANDLE = 14.0
     MIN_CROP = 0.03
+    BG = QColor("#0d0d0e")
 
-    def __init__(self):
-        super().__init__()
-        self.setMinimumSize(320, 240)
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._pix = None
         self._iw = self._ih = 1              # size of the pixmap
         self._fw = self._fh = 1              # size of the same picture at full resolution
-        self._zoom = 1.0                     # device pixels per full-resolution pixel
-        self._cx = self._cy = 0.5            # which part of the picture sits in the middle
+        self._zoom = 1.0                     # device pixels per full-resolution pixel (target)
+        self._cx = self._cy = 0.5            # which part of the picture sits in the middle of the free area
         self._fit = True
         self.tool = "pan"
         self._crop = (0.0, 0.0, 1.0, 1.0)
         self._aspect_k = None
         self._drag = None                    # ("pan"|"crop"|"pick", ...)
-        self._message = "Add .SRF files with the buttons on the left,\nor drop files and folders anywhere in this window."
+        self._free = QRectF(0, 0, 100, 100)  # the part of the window not covered by panels
+        self._scene = None
+        self._scene_dirty = True
+        self._version = 0
+        self._ambient = None
+        self._ambient_cache = None
+        self.shadow_targets = lambda: []     # set by the window: [(QRectF, kind, extra)] to cast shadows
+        self._drv = SpringDriver(self._view_frame)
+        self._dz = self._drv.spring(1.0, 260, 30, 0.0002)
+        self._dx = self._drv.spring(0.5, 260, 30, 0.00005)
+        self._dy = self._drv.spring(0.5, 260, 30, 0.00005)
         self._apply_cursor(None)
 
-    # ----- geometry (plain floats, logical pixels) -----
+    # ----- the glass source -----
+    @property
+    def origin(self):
+        return self.window()
+
+    def version(self):
+        if self._scene_dirty or self._scene is None:
+            self._render_scene()
+        return self._version
+
+    def scene(self):
+        if self._scene_dirty or self._scene is None:
+            self._render_scene()
+        return self._scene
+
+    def _invalidate(self):
+        self._scene_dirty = True
+        self.update()
+
     def _dpr(self):
         try:
             return max(1.0, float(self.devicePixelRatioF()))
         except Exception:
             return 1.0
 
-    def _pad(self):
-        return 44.0 if self.tool == "crop" else 22.0
+    def _render_scene(self):
+        dpr = self._dpr()
+        W, H = max(1, self.width()), max(1, self.height())
+        img = QImage(int(math.ceil(W * dpr)), int(math.ceil(H * dpr)), QImage.Format.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(self.BG)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self._pix is not None:
+            left, top, w, h = self._image_rect()
+            if APPEARANCE.get("ambient", True) and self._ambient is not None:
+                self._paint_ambient(p, W, H, QRectF(left, top, w, h))
+            rect = QRectF(left, top, w, h)
+            if w < W - 2 or h < H - 2:
+                paint_shadow(p, rect, 0.0, (24.0, 64.0, 0.0, 0.65))
+                paint_shadow(p, rect, 0.0, (4.0, 12.0, 0.0, 0.4))
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, (w / self._iw) < 3.0)
+            p.drawPixmap(rect, self._pix, QRectF(0.0, 0.0, float(self._iw), float(self._ih)))
+        p.end()
+        self._scene = img
+        self._scene_dirty = False
+        self._version += 1
+
+    def _paint_ambient(self, p, W, H, rect):
+        """The picture's own colours, very blurred, glowing around it (and under the glass)."""
+        key = (W, H)
+        if self._ambient_cache is None or self._ambient_cache[0] != key:
+            amb = self._ambient
+            aw, ah = amb.width(), amb.height()
+            s = max(W / float(aw), H / float(ah)) * 1.15
+            tw, th = aw * s, ah * s
+            pix = QImage(W, H, QImage.Format.Format_ARGB32_Premultiplied)
+            pix.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pix)
+            q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            q.setOpacity(0.5)
+            q.drawImage(QRectF((W - tw) / 2.0, (H - th) / 2.0, tw, th), amb)
+            q.end()
+            self._ambient_cache = (key, pix)
+        p.drawImage(QPointF(0, 0), self._ambient_cache[1])
+
+    # ----- geometry (plain floats, logical pixels) -----
+    def set_free_rect(self, rect, animate=True):
+        """The part of the window the picture is fitted into (between the panels)."""
+        rect = QRectF(rect)
+        if rect == self._free:
+            return
+        self._free = rect
+        if self._pix is not None:
+            if self._fit:
+                self._zoom = self._fit_zoom()
+                self._cx = self._cy = 0.5
+                self.zoomChanged.emit(self._zoom * 100.0)
+            self._clamp_centre()
+            self._animate(animate)
+        else:
+            self._invalidate()
+
+    def free_rect(self):
+        return QRectF(self._free)
+
+    def _pads(self):
+        return (36.0, 30.0) if self.tool == "crop" else (8.0, 0.0)
 
     def _fit_zoom(self):
-        pad = self._pad()
-        avail_w = max(32.0, self.width() - 2.0 * pad)
-        avail_h = max(32.0, self.height() - 2.0 * pad)
+        px, py = self._pads()
+        avail_w = max(32.0, self._free.width() - 2.0 * px)
+        avail_h = max(32.0, self._free.height() - 2.0 * py)
         return min(avail_w / self._fw, avail_h / self._fh) * self._dpr()
 
-    def _image_rect(self):
-        s = self._zoom / self._dpr()
+    def _rect_for(self, zoom, cx, cy):
+        s = zoom / self._dpr()
         w, h = self._fw * s, self._fh * s
-        return self.width() / 2.0 - self._cx * w, self.height() / 2.0 - self._cy * h, w, h
+        c = self._free.center()
+        return c.x() - cx * w, c.y() - cy * h, w, h
+
+    def _image_rect(self):
+        """Where the picture is drawn now (follows the animation)."""
+        return self._rect_for(self._dz.x, self._dx.x, self._dy.x)
+
+    def _target_rect(self):
+        return self._rect_for(self._zoom, self._cx, self._cy)
 
     def _clamp_centre(self):
         s = self._zoom / self._dpr()
-        for axis, (size, view) in enumerate(((self._fw * s, float(self.width())),
-                                             (self._fh * s, float(self.height())))):
+        for axis, (size, view) in enumerate(((self._fw * s, self._free.width()),
+                                             (self._fh * s, self._free.height()))):
             if size <= view:
                 c = 0.5
             else:
@@ -5614,38 +7555,69 @@ class ImageView(QWidget):
             else:
                 self._cy = c
 
+    def _animate(self, animate=True, k=None):
+        self._dz.target, self._dx.target, self._dy.target = self._zoom, self._cx, self._cy
+        if k is not None:
+            for s in (self._dz, self._dx, self._dy):
+                s.k, s.c = k
+        if animate and motion_on() and self.isVisible() and self._pix is not None:
+            self._drv.kick()
+        else:
+            for s in (self._dz, self._dx, self._dy):
+                s.snap()
+            self._view_frame()
+
+    def _view_frame(self):
+        self._invalidate()
+        self.viewMoved.emit()
+
+    def _set_now(self):
+        """Jump the drawn view to the target (no animation), e.g. while dragging."""
+        self._drv.stop()
+        for s in (self._dz, self._dx, self._dy):
+            s.snap((self._zoom, self._cx, self._cy)[(self._dz, self._dx, self._dy).index(s)])
+        self._view_frame()
+
     # ----- public API -----
     def has_image(self):
         return self._pix is not None
 
-    def set_message(self, text):
-        self._message = text
-        self.update()
-
     def clear(self):
         self._pix = None
-        self.update()
+        self._ambient = None
+        self._ambient_cache = None
+        self._invalidate()
 
     def set_image(self, arr, full_w, full_h):
         """Show `arr` (uint8 RGB). full_w x full_h is the size this picture has at
         full resolution, so zoom percentages stay true at any preview resolution."""
+        first = self._pix is None
         self._pix = array_to_pixmap(arr)
         self._ih, self._iw = int(arr.shape[0]), int(arr.shape[1])
         resized = (int(full_w), int(full_h)) != (self._fw, self._fh)
         self._fw, self._fh = max(1, int(full_w)), max(1, int(full_h))
+        self._make_ambient(arr)
         if self._fit or resized:
             self._fit = True
             self._zoom = self._fit_zoom()
             self._cx = self._cy = 0.5
             self.zoomChanged.emit(self._zoom * 100.0)
         self._clamp_centre()
-        self.update()
+        self._animate(animate=not first and not resized)
+
+    def _make_ambient(self, arr):
+        step = max(1, max(arr.shape[0], arr.shape[1]) // 96)
+        small = np.ascontiguousarray(arr[::step, ::step]).astype(np.float32)
+        small = gaussian_filter(small, sigma=(2.2, 2.2, 0))
+        small = np.clip(small * 0.9, 0, 255).astype(np.uint8)
+        self._ambient = array_to_image(small)
+        self._ambient_cache = None
 
     def set_tool(self, tool):
         self.tool = tool
         self._drag = None
         self._apply_cursor(None)
-        self.update()
+        self._invalidate()
 
     def set_crop(self, crop):
         self._crop = tuple(float(v) for v in crop)
@@ -5661,39 +7633,46 @@ class ImageView(QWidget):
     def zoom_percent(self):
         return self._zoom * 100.0
 
+    def fit_percent(self):
+        return self._fit_zoom() * 100.0
+
+    def is_fit(self):
+        return self._fit
+
     def request_fit(self):
         """Fit the next picture that is shown (used when its shape is about to change)."""
         self._fit = True
 
-    def fit(self):
+    def fit(self, animate=True):
         self._fit = True
         self._zoom = self._fit_zoom()
         self._cx = self._cy = 0.5
         self.zoomChanged.emit(self._zoom * 100.0)
-        self.update()
+        self._animate(animate)
 
-    def set_zoom(self, zoom, at=None):
-        """Zoom keeping the point under `at` (widget x, y) fixed; default is the centre."""
+    def set_zoom(self, zoom, at=None, animate=True):
+        """Zoom keeping the point under `at` (widget x, y) fixed; default is the middle of the free area."""
         if self._pix is None:
             return
         fit = self._fit_zoom()
         zoom = min(max(zoom, min(fit, 1.0)), 16.0)       # never smaller than "fit" (or 100% for tiny crops)
-        ax, ay = at if at else (self.width() / 2.0, self.height() / 2.0)
-        left, top, w, h = self._image_rect()
+        c = self._free.center()
+        ax, ay = at if at else (c.x(), c.y())
+        left, top, w, h = self._target_rect()
         u, v = (ax - left) / w, (ay - top) / h
         self._zoom = zoom
         self._fit = False
         s = zoom / self._dpr()
         w, h = self._fw * s, self._fh * s
-        self._cx = (self.width() / 2.0 - (ax - u * w)) / w
-        self._cy = (self.height() / 2.0 - (ay - v * h)) / h
+        self._cx = (c.x() - (ax - u * w)) / w
+        self._cy = (c.y() - (ay - v * h)) / h
         if abs(zoom - fit) <= fit * 0.001:
             self._zoom = fit
             self._fit = True
             self._cx = self._cy = 0.5
         self._clamp_centre()
         self.zoomChanged.emit(self._zoom * 100.0)
-        self.update()
+        self._animate(animate)
 
     def zoom_step(self, direction, at=None):
         self.set_zoom(self._zoom * (1.25 if direction > 0 else 0.8), at)
@@ -5702,26 +7681,27 @@ class ImageView(QWidget):
         self.set_zoom(1.0, at)
 
     # ----- painting -----
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
+        if self._scene_dirty or self._scene is None:
+            self._render_scene()
         p = QPainter(self)
+        p.drawImage(QPointF(0, 0), self._scene)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        area = QRectF(0.0, 0.0, float(self.width()), float(self.height()))
-        clip = QPainterPath()
-        clip.addRoundedRect(area, 20.0, 20.0)
-        p.setClipPath(clip)
-        p.fillRect(area, QColor(0, 0, 0, 120))
-        if self._pix is None:
-            p.setPen(QColor(236, 236, 241, 140))
-            p.drawText(area, self._message, QTextOption(Qt.AlignmentFlag.AlignCenter))
-            p.end()
-            return
-        left, top, w, h = self._image_rect()
-        # smooth when shrinking or mildly enlarging; crisp pixels when zoomed far in
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, (w / self._iw) < 3.0)
-        p.drawPixmap(QRectF(left, top, w, h), self._pix, QRectF(0.0, 0.0, float(self._iw), float(self._ih)))
-        if self.tool == "crop":
+        for rect, kind, extra in self.shadow_targets():
+            spec = GLASS_KINDS[kind]
+            shadow = spec["shadow"]
+            if extra:
+                shadow = (34.0, 60.0, -20.0, 0.7)
+            paint_shadow(p, rect, spec["r"], shadow)
+        if self._pix is not None and self.tool == "crop":
+            left, top, w, h = self._image_rect()
             self._paint_crop(p, left, top, w, h)
         p.end()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._ambient_cache = None
+        self._invalidate()
 
     def _crop_rect_px(self):
         left, top, w, h = self._image_rect()
@@ -5730,21 +7710,23 @@ class ImageView(QWidget):
 
     def _paint_crop(self, p, left, top, w, h):
         cx0, cy0, cx1, cy1 = self._crop_rect_px()
-        shade = QColor(0, 0, 0, 160)
+        shade = QColor(0, 0, 0, 128)
         p.fillRect(QRectF(left, top, w, cy0 - top), shade)
         p.fillRect(QRectF(left, cy1, w, top + h - cy1), shade)
         p.fillRect(QRectF(left, cy0, cx0 - left, cy1 - cy0), shade)
         p.fillRect(QRectF(cx1, cy0, left + w - cx1, cy1 - cy0), shade)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 75), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, 150), 1.0))
         for i in (1, 2):
             x = cx0 + (cx1 - cx0) * i / 3.0
             y = cy0 + (cy1 - cy0) * i / 3.0
             p.drawLine(QPointF(x, cy0), QPointF(x, cy1))
             p.drawLine(QPointF(cx0, y), QPointF(cx1, y))
-        p.setPen(QPen(QColor(255, 255, 255, 235), 1.5))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
         p.drawRect(QRectF(cx0, cy0, cx1 - cx0, cy1 - cy0))
-        p.setPen(QPen(QColor(255, 255, 255), 3.5))
+        pen = QPen(QColor(255, 255, 255), 3.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
         n = min(18.0, (cx1 - cx0) / 3.0, (cy1 - cy0) / 3.0)
         for x, sx in ((cx0, 1.0), (cx1, -1.0)):
             for y, sy in ((cy0, 1.0), (cy1, -1.0)):
@@ -5775,10 +7757,10 @@ class ImageView(QWidget):
         return name or "move"
 
     def _apply_cursor(self, hit):
-        shape = Qt.CursorShape.OpenHandCursor
+        shape = Qt.CursorShape.OpenHandCursor if self._pix is not None else Qt.CursorShape.ArrowCursor
         if self._drag and self._drag[0] == "pan":
             shape = Qt.CursorShape.ClosedHandCursor
-        elif self.tool == "pick":
+        elif self.tool == "pick" and self._pix is not None:
             shape = Qt.CursorShape.CrossCursor
         elif self.tool == "crop" and hit:
             shape = {"move": Qt.CursorShape.SizeAllCursor,
@@ -5789,6 +7771,7 @@ class ImageView(QWidget):
         self.setCursor(QCursor(shape))
 
     def mousePressEvent(self, event):
+        self.setFocus()
         if self._pix is None:
             return
         pos = event.position()
@@ -5803,6 +7786,7 @@ class ImageView(QWidget):
             self._drag = ("pick", x, y)
             return
         if button in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            self._set_now()
             self._drag = ("pan", x, y, self._cx, self._cy)
             self._apply_cursor(None)
 
@@ -5819,7 +7803,7 @@ class ImageView(QWidget):
             self._cx, self._cy = cx - (x - sx) / w, cy - (y - sy) / h
             self._fit = False
             self._clamp_centre()
-            self.update()
+            self._set_now()
         elif self._drag[0] == "crop":
             _, hit, sx, sy, start = self._drag
             self._crop = self._dragged_crop(hit, start, (x - sx) / w, (y - sy) / h)
@@ -5883,233 +7867,865 @@ class ImageView(QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
-        wanted = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape)
-        if self.tool != "pan" and any(key == k or key == getattr(k, "value", None) for k in wanted):
+        if self.tool != "pan" and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
             self.applyRequested.emit()
         else:
             super().keyPressEvent(event)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._pix is not None:
-            if self._fit:
-                self._zoom = self._fit_zoom()
-                self.zoomChanged.emit(self._zoom * 100.0)
-            self._clamp_centre()
+
+# ---------------------------------------------------------------------
+# Scopes: histogram, waveform, RGB parade, vectorscope
+# ---------------------------------------------------------------------
+
+SCOPE_TYPES = ["Histogram", "Waveform", "RGB parade", "Vectorscope"]
+SCOPE_DEFAULTS = {"type": "Histogram", "channels": "RGB", "scale": "Linear", "bins": 256, "clip": True,
+                  "size": 100, "gain": 85, "graticule": True, "corner": "tl", "visible": True}
 
 
-class ViewerArea(QWidget):
-    """The image view with the floating glass controls laid over it."""
+def scope_sample(img8, target=200_000):
+    """A smaller copy of the picture for the scopes (every n-th pixel)."""
+    if img8 is None or img8.size == 0:
+        return None
+    step = max(1, int(math.sqrt(img8.shape[0] * img8.shape[1] / float(target))))
+    return np.ascontiguousarray(img8[::step, ::step])
 
-    def __init__(self):
+
+def scope_histogram(sample):
+    px = sample.reshape(-1, 3)
+    rgb = [np.bincount(px[:, c], minlength=256)[:256].astype(np.float64) for c in range(3)]
+    luma = (px[:, 0] * 0.2126 + px[:, 1] * 0.7152 + px[:, 2] * 0.0722 + 0.5).astype(np.int64)
+    lum = np.bincount(np.clip(luma, 0, 255), minlength=256)[:256].astype(np.float64)
+    n = float(max(1, px.shape[0]))
+    clip_lo = float((px <= 0).all(axis=1).sum()) / n
+    clip_hi = float((px >= 255).any(axis=1).sum()) / n
+    return {"r": rgb[0], "g": rgb[1], "b": rgb[2], "l": lum, "clip_lo": clip_lo, "clip_hi": clip_hi}
+
+
+def _wave_counts(values, cols, ncols, rows=128):
+    v = (values.astype(np.int64) * rows) // 256
+    return np.bincount((rows - 1 - v) * ncols + cols, minlength=rows * ncols)[:rows * ncols].reshape(rows, ncols)
+
+
+def _tone(counts, gain=1.0):
+    peak = max(1.0, float(np.percentile(counts[counts > 0], 99))) if (counts > 0).any() else 1.0
+    return np.clip(np.log1p(counts) / np.log1p(peak) * gain, 0.0, 1.0)
+
+
+def scope_image(sample, kind, gain=0.85):
+    """The scope picture as an RGBA QImage: waveform (RGB overlay), RGB parade or vectorscope."""
+    h, w = sample.shape[:2]
+    if kind == "Vectorscope":
+        n = 160
+        px = sample.reshape(-1, 3).astype(np.float32) / 255.0
+        cb = -0.168736 * px[:, 0] - 0.331264 * px[:, 1] + 0.5 * px[:, 2]
+        cr = 0.5 * px[:, 0] - 0.418688 * px[:, 1] - 0.081312 * px[:, 2]
+        xi = np.clip(((cb * 1.6 + 0.5) * (n - 1)).astype(np.int64), 0, n - 1)
+        yi = np.clip(((0.5 - cr * 1.6) * (n - 1)).astype(np.int64), 0, n - 1)
+        counts = np.bincount(yi * n + xi, minlength=n * n)[:n * n].reshape(n, n).astype(np.float32)
+        t = _tone(counts, 1.0)
+        ys, xs = np.mgrid[0:n, 0:n].astype(np.float32)
+        cbg = (xs / (n - 1) - 0.5) / 1.6
+        crg = (0.5 - ys / (n - 1)) / 1.6
+        y0 = 0.6
+        r = y0 + 1.402 * crg
+        g = y0 - 0.344136 * cbg - 0.714136 * crg
+        b = y0 + 1.772 * cbg
+        col = np.clip(np.stack([r, g, b], axis=2), 0, 1) * 0.6 + 0.4
+        rgba_ = np.zeros((n, n, 4), np.float32)
+        a = np.clip(t * gain * 1.2, 0, 1)
+        rgba_[:, :, :3] = col * a[:, :, None]
+        rgba_[:, :, 3] = a
+    else:
+        ncols = 256
+        cols = np.broadcast_to((np.arange(w) * ncols // max(1, w))[None, :], (h, w)).ravel()
+        colours = ((1.0, 0.33, 0.33), (0.35, 1.0, 0.45), (0.35, 0.6, 1.0))
+        if kind == "RGB parade":
+            third = ncols // 3
+            pc = np.broadcast_to((np.arange(w) * third // max(1, w))[None, :], (h, w)).ravel()
+            out = np.zeros((128, third * 3, 3), np.float32)
+            for c in range(3):
+                t = _tone(_wave_counts(sample[:, :, c].ravel(), pc, third), 1.0)
+                out[:, c * third:(c + 1) * third, :] = t[:, :, None] * np.array(colours[c], np.float32)
+        else:
+            out = np.zeros((128, ncols, 3), np.float32)
+            for c in range(3):
+                t = _tone(_wave_counts(sample[:, :, c].ravel(), cols, ncols), 1.0)
+                out += t[:, :, None] * np.array(colours[c], np.float32) * 0.75
+        a = np.clip(out.max(axis=2) * gain * 1.15, 0, 1)
+        rgb_ = np.clip(out, 0, 1)
+        rgba_ = np.zeros(out.shape[:2] + (4,), np.float32)
+        rgba_[:, :, :3] = rgb_ * np.clip(gain * 1.15, 0, 1)
+        rgba_[:, :, 3] = a
+        rgba_[:, :, :3] = np.minimum(rgba_[:, :, :3], a[:, :, None])
+    arr = np.ascontiguousarray((np.clip(rgba_, 0, 1) * 255).astype(np.uint8))
+    hh, ww = arr.shape[:2]
+    return QImage(arr.data, ww, hh, 4 * ww, QImage.Format.Format_RGBA8888_Premultiplied).copy()
+
+
+class ScopeHud(GlassMixin, QWidget):
+    """The floating scope. Drag it anywhere; let go and it springs into the
+    nearest corner. Right-click (or Enter) for its options."""
+    optionsRequested = Signal()
+    cornerChanged = Signal(str)
+    M = 14                                    # room around the glass for the wobble
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.glass_kind = "hud"
+        self.opts = dict(SCOPE_DEFAULTS)
+        self._sample = None
+        self._hist = None
+        self._img = None
+        self._img_key = None
+        self._drag = None
+        self._dragging = False
+        self._skew = 0.0
+        self._wob = 1.0                        # 0..1 progress of the landing wobble
+        self._place = None                     # callable(corner) -> QPoint (top-left of the widget)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        self.setToolTip("Drag to move it to another corner. Right-click or press Enter for options.")
+        self._drv = SpringDriver(self._frame, on_step=self._step)
+        self._x = self._drv.spring(0.0, 220, 18, 0.2)
+        self._y = self._drv.spring(0.0, 220, 18, 0.2)
+        self._sk = self._drv.spring(0.0, 300, 14, 0.02)
+        self._resize_to_fit()
+
+    # ----- size -----
+    def body_size(self):
+        k = float(self.opts["size"]) / 100.0
+        W = int(round(232 * k))
+        if self.opts["type"] == "Vectorscope":
+            ph = W - 18
+        else:
+            ph = int(round(78 * k))
+        return W, ph + 17
+
+    def _resize_to_fit(self):
+        w, h = self.body_size()
+        self.resize(w + 2 * self.M, h + 2 * self.M)
+
+    def glass_rect(self):
+        return QRectF(self.M, self.M, self.width() - 2 * self.M, self.height() - 2 * self.M)
+
+    def glass_geometry(self):
+        """The glass body in parent coordinates (for its shadow)."""
+        return QRectF(self.geometry()).adjusted(self.M, self.M, -self.M, -self.M)
+
+    def set_options(self, **kw):
+        self.opts.update(kw)
+        self._img_key = None
+        self._resize_to_fit()
+        self._recompute()
+        if self._place is not None:
+            self.move_to_corner(animate=True)
+        self.update()
+
+    # ----- data -----
+    def set_image(self, img8):
+        self._sample = scope_sample(img8)
+        self._img_key = None
+        self._recompute()
+        self.update()
+
+    def clip_fractions(self):
+        if self._hist is None:
+            return 0.0, 0.0
+        return self._hist["clip_lo"], self._hist["clip_hi"]
+
+    def _recompute(self):
+        if self._sample is None:
+            self._hist = None
+            self._img = None
+            return
+        if self._hist is None or self._img_key is None:
+            self._hist = scope_histogram(self._sample)
+        t = self.opts["type"]
+        if t != "Histogram":
+            key = (t, int(self.opts["gain"]), id(self._sample))
+            if key != self._img_key:
+                self._img = scope_image(self._sample, t, float(self.opts["gain"]) / 100.0)
+                self._img_key = key
+        else:
+            self._img_key = ("Histogram", id(self._sample))
+
+    # ----- placement -----
+    def corner(self):
+        return self.opts["corner"]
+
+    def move_to_corner(self, animate=True):
+        if self._place is None:
+            return
+        target = self._place(self.opts["corner"])
+        self._x.target, self._y.target = float(target.x()), float(target.y())
+        if animate and motion_on() and self.isVisible():
+            self._x.x, self._y.x = float(self.x()), float(self.y())
+            self._drv.kick()
+        else:
+            self._x.snap()
+            self._y.snap()
+            self.move(target)
+
+    def _frame(self):
+        if not self._dragging:
+            self.move(int(round(self._x.x)), int(round(self._y.x)))
+        self.update()
+
+    def _step(self, dt):
+        if self._wob < 1.0:
+            self._wob = min(1.0, self._wob + dt / 0.7)
+
+    # ----- mouse -----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self.optionsRequested.emit()
+            return
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        self._drag = (e.globalPosition(), QPointF(self.pos()), e.globalPosition().x(), time.monotonic())
+        self._dragging = False
+        self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+
+    def mouseMoveEvent(self, e):
+        if self._drag is None:
+            return
+        start, pos0, lx, lt = self._drag
+        d = e.globalPosition() - start
+        if not self._dragging and abs(d.x()) + abs(d.y()) < 4:
+            return
+        if not self._dragging:
+            self._dragging = True
+            self._drv.stop()
+            self.raise_()
+        now = time.monotonic()
+        vx = (e.globalPosition().x() - lx) / max(0.001, (now - lt) * 1000.0)
+        self._drag = (start, pos0, e.globalPosition().x(), now)
+        self._skew += (max(-12.0, min(12.0, -vx * 9.0)) - self._skew) * 0.25
+        self._sk.snap(self._skew)
+        x, y = pos0.x() + d.x(), pos0.y() + d.y()
+        parent = self.parentWidget()
+        if parent is not None:                    # past the window edge it drags like rubber
+            def band(v, lo, hi):
+                if v < lo:
+                    return lo - (lo - v) * 0.3
+                if v > hi:
+                    return hi + (v - hi) * 0.3
+                return v
+            x = band(x, -self.M + 6, parent.width() - self.width() + self.M - 6)
+            y = band(y, -self.M + 6, parent.height() - self.height() + self.M - 6)
+        self.move(int(round(x)), int(round(y)))
+        self.update()
+        if parent is not None and hasattr(parent, "canvas"):
+            parent.canvas.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._drag is None:
+            return
+        dragged = self._dragging
+        self._drag = None
+        self._dragging = False
+        self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        if not dragged:
+            return
+        area = self.parentWidget().hud_area() if hasattr(self.parentWidget(), "hud_area") else None
+        g = self.glass_geometry()
+        if area is not None:
+            c = g.center()
+            corner = ("t" if c.y() < area.center().y() else "b") + ("l" if c.x() < area.center().x() else "r")
+            if corner != self.opts["corner"]:
+                self.opts["corner"] = corner
+                self.cornerChanged.emit(corner)
+        self._x.x, self._y.x = float(self.x()), float(self.y())
+        self._sk.x = self._skew
+        self._sk.target = 0.0
+        self._skew = 0.0
+        self._wob = 0.0
+        self._drv.hold = lambda: self._wob < 1.0
+        self.move_to_corner(animate=True)
+        if not motion_on():
+            self._sk.snap(0.0)
+            self._wob = 1.0
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.optionsRequested.emit()
+        else:
+            super().keyPressEvent(e)
+
+    def contextMenuEvent(self, e):
+        e.accept()
+
+    # ----- painting -----
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        body = self.glass_rect()
+        c = body.center()
+        sx = sy = 1.0
+        if self._wob < 1.0:
+            keys = ((0.0, 1.0, 1.0), (0.22, 1.1, 0.9), (0.48, 0.95, 1.06), (0.72, 1.03, 0.98), (1.0, 1.0, 1.0))
+            t = self._wob
+            for (t0, x0, y0), (t1, x1, y1) in zip(keys, keys[1:]):
+                if t <= t1:
+                    f = (t - t0) / (t1 - t0)
+                    f = 1 - (1 - f) * (1 - f)
+                    sx, sy = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f
+                    break
+        skew = self._skew if self._dragging else self._sk.x
+        tr = QTransform()
+        tr.translate(c.x(), c.y())
+        tr.shear(math.tan(math.radians(skew)), 0.0)
+        tr.scale(sx, sy)
+        tr.translate(-c.x(), -c.y())
+        p.setTransform(tr)
+        self.paint_glass(p, body)
+        plot = body.adjusted(9, 9, -9, -8)
+        if self.opts["type"] == "Histogram":
+            self._paint_histogram(p, plot)
+        else:
+            self._paint_scope(p, plot)
+        if self.hasFocus():
+            p.setPen(QPen(accent(), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(rounded(body.adjusted(1, 1, -1, -1), 14))
+        p.end()
+
+    def _paint_histogram(self, p, r):
+        h = self._hist
+        if h is None:
+            return
+        bins = int(self.opts["bins"])
+        per = 256 // bins
+
+        def rebin(a):
+            return a.reshape(bins, per).mean(axis=1)
+
+        ch = self.opts["channels"]
+        sets = {}
+        if ch != "Luma":
+            for c in "rgb":
+                sets[c] = rebin(h[c])
+        if ch != "RGB":
+            sets["l"] = rebin(h["l"])
+        peak = 1.0
+        for a in sets.values():
+            if bins > 2:
+                peak = max(peak, float(a[1:-1].max()))
+        log = self.opts["scale"] == "Log"
+
+        def tf(v):
+            if log:
+                return np.minimum(1.0, np.log1p(v * 0.06) / math.log1p(peak * 0.06))
+            return np.minimum(1.0, v / peak)
+
+        def path(vals):
+            t = tf(vals)
+            pp = QPainterPath()
+            pp.moveTo(r.left(), r.bottom())
+            bw = r.width() / bins
+            for i in range(bins):
+                y = r.bottom() - float(t[i]) * r.height() * 0.97
+                pp.lineTo(r.left() + i * bw, y)
+                pp.lineTo(r.left() + (i + 1) * bw, y)
+            pp.lineTo(r.right(), r.bottom())
+            pp.closeSubpath()
+            return pp
+
+        p.save()
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Screen)
+        for c, col in (("r", rgba(229, 72, 77, 0.8)), ("g", rgba(70, 194, 106, 0.8)), ("b", rgba(74, 144, 255, 0.8))):
+            if c in sets:
+                p.fillPath(path(sets[c]), col)
+        p.restore()
+        if "l" in sets:
+            p.fillPath(path(sets["l"]), rgba(242, 242, 245, 0.85 if ch == "Luma" else 0.4))
+        if self.opts["clip"]:
+            for x, on, col in ((r.left() + 1, h["clip_lo"] > 0.0001, QColor("#5aa2ff")),
+                               (r.right() - 7, h["clip_hi"] > 0.0001, QColor("#ff6a5a"))):
+                p.fillPath(rounded(QRectF(x, r.top() + 1, 6, 6), 1.5), col if on else white(0.2))
+
+    def _paint_scope(self, p, r):
+        t = self.opts["type"]
+        vec = t == "Vectorscope"
+        if vec:
+            side = min(r.width(), r.height())
+            r = QRectF(r.center().x() - side / 2.0, r.top(), side, side)
+        grat = self.opts["graticule"]
+        if grat:
+            p.setPen(Qt.PenStyle.NoPen)
+            if vec:
+                p.setPen(QPen(white(0.3), 1.0))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(r.adjusted(0.5, 0.5, -0.5, -0.5))
+                p.setPen(QPen(white(0.14), 1.0))
+                p.drawLine(QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()))
+                p.drawLine(QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y()))
+                p.setPen(QPen(rgba(255, 196, 150, 0.55), 1.0))
+                a = math.radians(-123.0)
+                c = r.center()
+                p.drawLine(c, QPointF(c.x() + math.cos(a) * r.width() / 2.0, c.y() + math.sin(a) * r.width() / 2.0))
+            else:
+                for i, al in ((0, 0.2), (1, 0.1), (2, 0.1), (3, 0.1), (4, 0.2)):
+                    y = r.top() + r.height() * i / 4.0
+                    p.fillRect(QRectF(r.left(), min(y, r.bottom() - 1), r.width(), 1.0), white(al))
+        if self._img is not None:
+            p.save()
+            if vec:
+                clip = QPainterPath()
+                clip.addEllipse(r)
+                p.setClipPath(clip)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Screen)
+            p.drawImage(r, self._img)
+            p.restore()
+
+
+class EmptyState(QWidget):
+    """What the window shows before any raw file is added."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(36, 32, 36, 32)
+        lay.setSpacing(12)
+        t = SLabel("Drop .SRF files or folders here", "h1")
+        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(t)
+        n = SLabel("The whole window accepts drops. Or pick them:", "note")
+        n.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(n)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        self.btn_files = GlassButton("Add files…", None, "pri", "Ctrl+O")
+        self.btn_files.setMinimumWidth(110)
+        self.btn_folder = GlassButton("Add folder…", None, "btn", "Ctrl+Shift+O")
+        row.addWidget(self.btn_files)
+        row.addWidget(self.btn_folder, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.setFixedWidth(420)
+        self.adjustSize()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(white(0.22), 1.0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setDashPattern([4.0, 3.0])
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(rounded(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 14))
+        p.end()
+
+
+class Toast(GlassMixin, QWidget):
+    """A short message near the bottom of the picture, with optional buttons
+    and a progress bar (used for exports)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.glass_kind = "toast"
+        self.lay = QHBoxLayout(self)
+        self.lay.setContentsMargins(14, 8, 8, 8)
+        self.lay.setSpacing(8)
+        self.label = SLabel("", "text", wrap=False)
+        self.lay.addWidget(self.label, 1)
+        self._buttons = []
+        self._progress = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        self.reveal = Reveal(parent)
+        self.on_place = None
+        self.hide()
+
+    def show_message(self, text, buttons=(), timeout=4000, progress=None):
+        """buttons: [(label, callback)]. timeout 0 keeps it up."""
+        for b in self._buttons:
+            b.setParent(None)
+            b.deleteLater()
+        self._buttons = []
+        self._set_text(text)
+        for label, cb in buttons:
+            b = GlassButton(label, None, "flat")
+            b.clicked.connect(cb)
+            self.lay.addWidget(b)
+            b.show()                     # children added to a shown widget start hidden
+            self._buttons.append(b)
+        self._progress = progress
+        self.lay.setContentsMargins(14, 8, 8 if buttons else 14, 8 + (4 if progress is not None else 0))
+        self.adjustSize()
+        was = self.isVisible()
+        if self.on_place:
+            self.on_place()
+        if not was:
+            self.hide()
+            self.reveal.play(self, "b", (0.9, 0.8), (0.0, 18.0))
+        self.raise_()
+        self.update()
+        if timeout:
+            self._timer.start(timeout)
+        else:
+            self._timer.stop()
+
+    def _set_text(self, text):
+        self.label.setText(text)
+        fm = QFontMetricsF(self.label.font())
+        self.label.setMinimumWidth(int(min(560, fm.horizontalAdvance(text) + 4)))
+
+    def set_progress(self, value, text=None):
+        self._progress = value
+        if text is not None and text != self.label.text():
+            self._set_text(text)
+            self.adjustSize()
+            if self.on_place:
+                self.on_place()
+        self.update()
+
+    def dismiss(self):
+        self._timer.stop()
+        self.reveal.finish()
+        self.hide()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        self.paint_glass(p, r)
+        if self._progress is not None:
+            bar = QRectF(14, r.height() - 9, r.width() - 28, 3)
+            p.fillPath(rounded(bar, 1.5), white(0.18))
+            fill = QRectF(bar.x(), bar.y(), bar.width() * max(0.0, min(1.0, self._progress)), 3)
+            if fill.width() > 0.5:
+                p.fillPath(rounded(fill, 1.5), accent())
+        p.end()
+
+
+class ThumbRail(QWidget):
+    """The thumbnails in the filmstrip: click to open, scroll sideways with the wheel."""
+    openRequested = Signal(str)
+
+    TW, TH, GAP = 56, 42, 9
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.entries = []                    # [(path, QPixmap or None, ticked, current)]
+        self._scroll = 0.0
+        self._hover = -1
+        self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFixedHeight(self.TH + 6)
+        self._drv = SpringDriver(self.update)
+        self._lift = self._drv.spring(0.0, 440, 13, 0.01)
+        self._lift_i = -1
+
+    def content_width(self):
+        n = len(self.entries)
+        return max(0, n * (self.TW + self.GAP) - self.GAP)
+
+    def set_entries(self, entries):
+        self.entries = entries
+        self._scroll = min(self._scroll, max(0.0, self.content_width() - self.width()))
+        self.update()
+
+    def ensure_current_visible(self):
+        for i, e in enumerate(self.entries):
+            if e[3]:
+                x = i * (self.TW + self.GAP)
+                if x < self._scroll:
+                    self._scroll = x
+                elif x + self.TW > self._scroll + self.width():
+                    self._scroll = x + self.TW - self.width()
+        self.update()
+
+    def _index_at(self, x):
+        i = int((x + self._scroll) // (self.TW + self.GAP))
+        if 0 <= i < len(self.entries) and (x + self._scroll) - i * (self.TW + self.GAP) <= self.TW:
+            return i
+        return -1
+
+    def mouseMoveEvent(self, e):
+        i = self._index_at(e.position().x())
+        if i != self._hover:
+            self._hover = i
+            self._lift_i = i
+            self._lift.snap(0.0)
+            self._lift.target = -2.0
+            self._drv.kick()
+            if 0 <= i < len(self.entries):
+                self.setToolTip(os.path.basename(self.entries[i][0]))
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self._lift.target = 0.0
+        self._drv.kick()
+
+    def mouseReleaseEvent(self, e):
+        i = self._index_at(e.position().x())
+        if i >= 0 and e.button() == Qt.MouseButton.LeftButton:
+            self.openRequested.emit(self.entries[i][0])
+
+    def wheelEvent(self, e):
+        d = e.angleDelta()
+        delta = d.x() if abs(d.x()) > abs(d.y()) else d.y()
+        self._scroll = min(max(0.0, self._scroll - delta * 0.5), max(0.0, self.content_width() - self.width()))
+        self.update()
+        e.accept()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.setClipRect(QRectF(self.rect()).adjusted(-2, -6, 2, 6))
+        y0 = 4.0
+        for i, (path, pix, ticked, current) in enumerate(self.entries):
+            x = i * (self.TW + self.GAP) - self._scroll
+            if x > self.width() or x + self.TW < 0:
+                continue
+            dy = self._lift.x if i == self._lift_i else 0.0
+            r = QRectF(x, y0 + dy, self.TW, self.TH)
+            path_ = rounded(r, 2.0)
+            paint_small_shadow(p, path_, 2.0, 0.55, steps=3)
+            if pix is not None and not pix.isNull():
+                p.save()
+                p.setClipPath(path_)
+                pw, ph = pix.width() / pix.devicePixelRatio(), pix.height() / pix.devicePixelRatio()
+                s = max(r.width() / pw, r.height() / ph)
+                tw, th = pw * s, ph * s
+                p.drawPixmap(QRectF(r.center().x() - tw / 2, r.center().y() - th / 2, tw, th), pix,
+                             QRectF(0, 0, pix.width(), pix.height()))
+                p.restore()
+            else:
+                p.fillPath(path_, white(0.1))
+            if current:
+                p.setPen(QPen(accent(), 2.0))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(rounded(r.adjusted(-1, -1, 1, 1), 3.0))
+            if ticked:
+                dot = QRectF(r.right() - 6, r.top() - 3, 9, 9)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(black(0.35))
+                p.drawEllipse(dot.translated(0, 1))
+                p.setBrush(accent())
+                p.drawEllipse(dot)
+        p.end()
+
+
+# ---------------------------------------------------------------------
+# Sheets: the export settings and sync dialogs slide up over the window
+# ---------------------------------------------------------------------
+
+class SheetFrame(GlassMixin, QFrame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.glass_kind = "sheet"
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.paint_glass(p, QRectF(self.rect()))
+        p.end()
+
+
+class SheetSeparator(QWidget):
+    def __init__(self, alpha=0.08):
         super().__init__()
-        self.setMinimumSize(420, 320)
-        self.view = ImageView()
-        self.view.setParent(self)
+        self._a = alpha
+        self.setFixedHeight(1)
 
-        # --- top toolbar ---
-        self.toolbar = QFrame(self)
-        self.toolbar.setObjectName("pill")
-        self.toolbar.setFixedHeight(44)
-        bar = QHBoxLayout(self.toolbar)
-        bar.setContentsMargins(8, 5, 8, 5)
-        bar.setSpacing(2)
-
-        def tool_button(text, tip, checkable=False):
-            b = QToolButton()
-            b.setText(text)
-            b.setToolTip(tip)
-            b.setCheckable(checkable)
-            b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            bar.addWidget(b)
-            return b
-
-        def separator():
-            line = QFrame()
-            line.setObjectName("sep")
-            line.setFixedSize(1, 20)
-            bar.addSpacing(5)
-            bar.addWidget(line)
-            bar.addSpacing(5)
-
-        self.btn_pan = tool_button("Move", "Drag to move around the picture, scroll to zoom  (V)", True)
-        self.btn_crop = tool_button("Crop", "Drag the frame to crop; switch tool to apply  (C)", True)
-        self.btn_pick = tool_button("Pick white", "Click something that should be neutral grey  (W)", True)
-        self.tools = QButtonGroup(self)
-        self.tools.setExclusive(True)
-        for b in (self.btn_pan, self.btn_crop, self.btn_pick):
-            self.tools.addButton(b)
-        self.btn_pan.setChecked(True)
-        separator()
-        self.btn_zoom_out = tool_button("\u2212", "Zoom out  (-)")
-        self.lbl_zoom = QLabel("\u2013")
-        self.lbl_zoom.setObjectName("zoom")
-        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_zoom.setFixedWidth(52)
-        bar.addWidget(self.lbl_zoom)
-        self.btn_zoom_in = tool_button("+", "Zoom in  (+)")
-        self.btn_fit = tool_button("Fit", "Fit the picture in the window  (F)")
-        self.btn_100 = tool_button("1:1", "One screen pixel per image pixel  (1)")
-        separator()
-        self.btn_clip = tool_button("Clipping", "Paint blown highlights red and crushed blacks blue  (J)", True)
-        self.btn_preview = tool_button("Preview \u25BE", "Preview resolution and quality", True)
-
-        # --- status pill, bottom left ---
-        self.status = QFrame(self)
-        self.status.setObjectName("status")
-        self.status.setFixedHeight(30)
-        sl = QHBoxLayout(self.status)
-        sl.setContentsMargins(14, 0, 14, 0)
-        self.lbl_status = QLabel("")
-        self.lbl_status.setObjectName("zoom")
-        sl.addWidget(self.lbl_status)
-        self.status.hide()
-
-        # --- preview quality popover, top right ---
-        self.popover = QFrame(self)
-        self.popover.setObjectName("popover")
-        self.popover.setFixedWidth(336)
-        pl = QVBoxLayout(self.popover)
-        pl.setContentsMargins(16, 14, 16, 16)
-        pl.setSpacing(9)
-        head = QLabel("PREVIEW QUALITY")
-        head.setObjectName("cardTitle")
-        pl.addWidget(head)
-        self.sl_res = QSlider(Qt.Orientation.Horizontal)
-        self.sl_res.setRange(0, len(RESOLUTIONS) - 1)
-        self.sl_res.setPageStep(1)
-        self.sl_res.setObjectName("centered")
-        pl.addWidget(QLabel("Resolution"))
-        pl.addWidget(self.sl_res)
-        self.lbl_res = muted_label("")
-        pl.addWidget(self.lbl_res)
-        self.sw_draft = SwitchRow("Draft while adjusting", True,
-                                  "Use the fast 25% preview while a slider moves, then sharpen")
-        pl.addWidget(self.sw_draft)
-        self.btn_full = QPushButton("Full quality")
-        self.btn_full.setToolTip("100% resolution, no draft step: every pixel exactly as a full-size "
-                                 "lossless export holds it")
-        pl.addWidget(self.btn_full)
-
-        line = QFrame()
-        line.setObjectName("sep")
-        line.setFixedHeight(1)
-        pl.addSpacing(4)
-        pl.addWidget(line)
-        pl.addSpacing(2)
-        head = QLabel("EXPORT PREVIEW")
-        head.setObjectName("cardTitle")
-        pl.addWidget(head)
-        self.sw_proof = SwitchRow(
-            "Show the picture as the export file", False,
-            "Renders the picture exactly as the export will hold it: its size, resampling, output "
-            "sharpening, colour space, bit depth and compression, through the real encoder and back. "
-            "At 1:1 one screen pixel is one pixel of the file.")
-        pl.addWidget(self.sw_proof)
-        self.cmb_proof_fmt = compact(QComboBox())
-        self.cmb_proof_fmt.setToolTip("The export's file type (the same setting as in Export settings)")
-        pl.addLayout(labelled_row("Format", self.cmb_proof_fmt, 70))
-        self.sl_proof_q = ParamSlider("Quality", 1, 100, 92, tip="The export's quality setting")
-        pl.addWidget(self.sl_proof_q)
-        self.cmb_proof_view = compact(QComboBox())
-        for key, label in PROOF_VIEWS:
-            self.cmb_proof_view.addItem(label, key)
-        self.cmb_proof_view.setToolTip("'What the compression changed' shows the difference between the "
-                                       "compressed file and the same pixels uncompressed, 8 times brighter")
-        pl.addLayout(labelled_row("Show", self.cmb_proof_view, 70))
-        self.lbl_proof_opts = muted_label("")
-        pl.addWidget(self.lbl_proof_opts)
-        self.lbl_proof = muted_label("")
-        pl.addWidget(self.lbl_proof)
-        self.btn_export_settings = QPushButton("Export settings\u2026")
-        self.btn_export_settings.setToolTip("Every export setting: size, sharpening, colour space, bit "
-                                            "depth, compression, metadata, destination")
-        pl.addWidget(self.btn_export_settings)
-        self.popover.hide()
-        self.btn_preview.toggled.connect(self._toggle_popover)
-
-        self.view.zoomChanged.connect(lambda z: self.lbl_zoom.setText(f"{z:.0f}%"))
-        self._place()
-
-    def _toggle_popover(self, on):
-        self.popover.setVisible(bool(on))
-        self._place()
-
-    def set_status(self, text):
-        self.lbl_status.setText(text)
-        self.status.setVisible(bool(text))
-        self._place()
-
-    def _place(self):
-        w, h = self.width(), self.height()
-        self.view.setGeometry(0, 0, w, h)
-        self.toolbar.adjustSize()
-        self.toolbar.move(max(8, (w - self.toolbar.width()) // 2), 14)
-        self.status.adjustSize()
-        self.status.move(16, h - self.status.height() - 16)
-        self.popover.adjustSize()
-        self.popover.move(max(8, w - self.popover.width() - 16), 66)
-        for overlay in (self.toolbar, self.status, self.popover):
-            overlay.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._place()
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), white(self._a))
+        p.end()
 
 
-# ---------------------------------------------------------------------
-# Dialogs
-# ---------------------------------------------------------------------
+class SheetDialog(QDialog):
+    """A modal sheet: covers the main window with a still picture of it, dims
+    it, and floats a glass sheet in the middle."""
 
-class ExportDialog(QDialog):
+    def __init__(self, parent, title, width=860):
+        super().__init__(parent)
+        self._width = width
+        self._scrim = 0.0
+        self._scroll = None
+        self.sheet = None
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self._host = parent.window() if parent is not None else None
+        self._bg = None
+        if self._host is not None:
+            pix = self._host.grab()
+            self._bg = pix.toImage()
+            self._bg.setDevicePixelRatio(pix.devicePixelRatio())
+        self.sheet = SheetFrame(self)
+        if self._bg is not None:
+            self.sheet.glass_source = StaticSource(self._bg, self)
+        v = QVBoxLayout(self.sheet)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self.title = SLabel(title, "h1", wrap=True)
+        self.title.setContentsMargins(18, 16, 18, 12)
+        v.addWidget(self.title)
+        v.addWidget(SheetSeparator())
+        self.body = QWidget()
+        self.body_layout = QHBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(0)
+        v.addWidget(self.body, 1)
+        v.addWidget(SheetSeparator(0.07))
+        self.footer = QHBoxLayout()
+        self.footer.setContentsMargins(18, 12, 18, 16)
+        self.footer.setSpacing(8)
+        v.addLayout(self.footer)
+        self.primary = None
+        self.reveal = Reveal(self)
+        self._drv = SpringDriver(self.update)
+        self._fade = self._drv.spring(0.0, 300, 35, 0.004)
+
+    def scroll_column(self):
+        """A scrolling column for the sheet's sections; returns its layout."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        inner = QWidget()
+        inner.setObjectName("clear")
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(18, 4, 18, 12)
+        col.setSpacing(0)
+        scroll.setWidget(inner)
+        self.body_layout.addWidget(scroll, 1)
+        self._scroll = scroll
+        return col
+
+    def section(self, col, title):
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 12, 0, 12)
+        lay.setSpacing(2)
+        cap = SLabel(title, "cap")
+        cap.setContentsMargins(0, 0, 0, 4)
+        lay.addWidget(cap)
+        col.addWidget(box)
+        col.addWidget(SheetSeparator(0.07))
+        return lay
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._host is not None:
+            top_left = self._host.mapToGlobal(QPoint(0, 0))
+            self.setGeometry(QRect(top_left, self._host.size()))
+        self._place_sheet()
+        self.sheet.hide()
+        if motion_on():
+            self._fade.snap(0.0)
+            self._fade.target = 1.0
+            self._drv.kick()
+        else:
+            self._fade.snap(1.0)
+        QTimer.singleShot(0, lambda: self.reveal.play(self.sheet, "c", (0.94, 0.94), (0.0, 10.0),
+                                                      k=320.0, c=13.0))
+
+    def _place_sheet(self):
+        if self.sheet is None or self.sheet.layout() is None:
+            return
+        W, H = self.width(), self.height()
+        w = min(self._width, W - 48)
+        lay = self.sheet.layout()
+        lay.activate()
+        want = lay.totalSizeHint().height()
+        if self._scroll is not None:
+            inner = self._scroll.widget()
+            want = max(want, self.title.sizeHint().height() + inner.sizeHint().height() + 70)
+        h = min(max(240, want), H - 48)
+        self.sheet.setGeometry((W - w) // 2, (H - h) // 2, w, h)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_sheet()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        if self._bg is not None:
+            p.drawImage(QPointF(0, 0), self._bg)
+        else:
+            p.fillRect(self.rect(), QColor("#0d0d0e"))
+        p.fillRect(self.rect(), black(0.38 * max(0.0, min(1.0, self._fade.x))))
+        if self.sheet.isVisible():
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            paint_shadow(p, QRectF(self.sheet.geometry()), GLASS_KINDS["sheet"]["r"], GLASS_KINDS["sheet"]["shadow"])
+        p.end()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.primary is not None:
+            fw = QApplication.focusWidget()
+            if not isinstance(fw, (QComboBox, QAbstractButton)):
+                self.primary.click()
+                return
+        super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        if not self.sheet.geometry().contains(e.position().toPoint()):
+            e.accept()                       # a click on the dimmed window does nothing
+            return
+        super().mousePressEvent(e)
+
+
+class ExportDialog(SheetDialog):
     """Everything about the output file: type, bit depth, compression, colour
     space, size, sharpening, metadata and destination. With settings_only it
     edits the settings without exporting (the export preview uses them too)."""
 
+    LW = 120
+
+    def _show_page(self, index):
+        """Show one format's controls; the stack takes that page's height, not the tallest one's."""
+        P = QSizePolicy.Policy
+        for i in range(self.stack.count()):
+            self.stack.widget(i).setSizePolicy(P.Preferred, P.Preferred if i == index else P.Ignored)
+        self.stack.setCurrentIndex(index)
+        self.stack.updateGeometry()
+
     def __init__(self, parent, opts, heading, estimate=None, settings_only=False):
-        super().__init__(parent)
-        self.setWindowTitle("Export settings" if settings_only else "Export")
-        self.setMinimumWidth(1000)
+        super().__init__(parent, heading, 860)
         self._estimate = estimate
         self._out_dir = opts.out_dir
         self._base = opts.copy()                 # anything this dialog has no control for is kept
         self._bits_wanted = int(opts.bits)       # the depth asked for, kept while a format cannot hold it
         self._space_wanted = opts.space          # ... and the colour space
         self._pct = None
+        self._loading = False
+        self._preset_on = -1
+        self._preset_opts = None
+        self._estimate_text = ""
+        LW = self.LW
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 18, 20, 18)
-        lay.setSpacing(12)
-        top = QHBoxLayout()
-        head = QLabel(heading)
-        head.setObjectName("h1")
-        head.setWordWrap(True)
-        top.addWidget(head, 1)
-        self.cmb_preset = compact(QComboBox())
-        self.cmb_preset.addItem("Start from a preset…", -1)
+        # ---- presets column ----
+        presets = PresetsBackground()
+        presets.setFixedWidth(196)
+        pl = QVBoxLayout(presets)
+        pl.setContentsMargins(8, 12, 8, 12)
+        pl.setSpacing(3)
+        cap = SLabel("Presets", "muted", wrap=False)
+        cap.setFont(ui_font(12.0, 600))
+        cap.setContentsMargins(10, 0, 0, 6)
+        pl.addWidget(cap)
+        self._preset_buttons = []
         for i, (label, _values) in enumerate(EXPORT_PRESETS):
-            self.cmb_preset.addItem(label, i)
-        self.cmb_preset.setMinimumWidth(360)
-        self.cmb_preset.setToolTip("Fills in the settings for a common use. The destination and the file "
-                                   "names stay as they are.")
-        top.addWidget(self.cmb_preset, 0)
-        lay.addLayout(top)
-        columns = QHBoxLayout()
-        columns.setSpacing(12)
-        left, right = QVBoxLayout(), QVBoxLayout()
-        left.setSpacing(12)
-        right.setSpacing(12)
-        columns.addLayout(left, 1)
-        columns.addLayout(right, 1)
-        lay.addLayout(columns)
+            short = label.split(":")[0]
+            b = GlassButton(short, None, "pre", label, checkable=True)
+            b.clicked.connect(lambda _c=False, i=i: self._preset_chosen(i))
+            pl.addWidget(b)
+            self._preset_buttons.append(b)
+        pl.addStretch(1)
+        self.body_layout.addWidget(presets, 0)
+        self._presets_panel = presets
+        col = self.scroll_column()
 
         def combo(items, tip=""):
-            c = compact(QComboBox())
-            for key, label in items:
-                c.addItem(label, key)
-            if tip:
-                c.setToolTip(tip)
-            return c
+            return combo_box(items, tip)
 
         def spin(lo, hi, step, suffix="", special="", tip=""):
             s = QSpinBox()
@@ -6117,6 +8733,8 @@ class ExportDialog(QDialog):
             s.setRange(lo, hi)
             s.setSingleStep(step)
             s.setSuffix(suffix)
+            s.setFixedHeight(28)
+            s.setFont(ui_font(12.5))
             if special:
                 s.setSpecialValueText(special)
             if tip:
@@ -6125,7 +8743,6 @@ class ExportDialog(QDialog):
 
         def pair(a, b):
             box = QWidget()
-            box.setObjectName("clear")
             h = QHBoxLayout(box)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(8)
@@ -6135,33 +8752,41 @@ class ExportDialog(QDialog):
 
         def row_widget(text, widget):
             box = QWidget()
-            box.setObjectName("clear")
-            r = labelled_row(text, widget)
+            r = labelled_row(text, widget, LW)
             r.setContentsMargins(0, 0, 0, 0)
             box.setLayout(r)
+            box.setMinimumHeight(30)
             return box
 
+        def slider(*a, **k):
+            k.setdefault("label_width", LW)
+            return ParamSlider(*a, **k)
+
+        def row(lay, text, widget):
+            r = labelled_row(text, widget, LW)
+            lay.addLayout(r)
+            return r
+
         # ---- file type ----
-        card, cl = make_card("File type and quality")
-        self.cmb_fmt = compact(QComboBox())
+        cl = self.section(col, "File type and quality")
+        self.cmb_fmt = combo([])
         for key, (label, _ext, _bits) in EXPORT_FORMATS.items():
             ok = format_available(key)
             self.cmb_fmt.addItem(label if ok else f"{label}  (needs {FORMAT_NEEDS.get(key, 'imagecodecs')})", key)
             if not ok:
                 self.cmb_fmt.model().item(self.cmb_fmt.count() - 1).setEnabled(False)
-        cl.addLayout(labelled_row("Format", self.cmb_fmt))
-        self.cmb_bits = compact(QComboBox())
-        cl.addLayout(labelled_row("Bit depth", self.cmb_bits))
+        row(cl, "Format", self.cmb_fmt)
+        self.cmb_bits = combo([])
+        row(cl, "Bit depth", self.cmb_bits)
         self.stack = QStackedWidget()
         cl.addWidget(self.stack)
         self._pages = {}
 
         def page(key):
             wdg = QWidget()
-            wdg.setObjectName("clear")
             v = QVBoxLayout(wdg)
             v.setContentsMargins(0, 0, 0, 0)
-            v.setSpacing(8)
+            v.setSpacing(2)
             self.stack.addWidget(wdg)
             self._pages[key] = self.stack.count() - 1
             return v
@@ -6174,7 +8799,7 @@ class ExportDialog(QDialog):
         if zstd_available():
             tiff_items.append(("zstd", "Zstandard  (lossless, fast; newer programs only)"))
         self.cmb_tiff = combo(tiff_items)
-        v.addLayout(labelled_row("Compression", self.cmb_tiff))
+        row(v, "Compression", self.cmb_tiff)
         v.addWidget(muted_label(
             "TIFF is lossless whatever the compression; it only changes the file size. 32-bit float "
             "is for HDR merging and very heavy editing." +
@@ -6185,7 +8810,7 @@ class ExportDialog(QDialog):
         self.cmb_dng = combo([("linear", "Linear: demosaiced here, 4 colour planes (about 64 MB)"),
                               ("mosaic", "Mosaic: untouched sensor data, the raw converter demosaics "
                                          "(about 16 MB)")])
-        v.addLayout(labelled_row("Contents", self.cmb_dng))
+        row(v, "Contents", self.cmb_dng)
         self.cmb_dng_look = combo(DNG_LOOKS, "Embeds a camera profile fitted to Image Data Converter, so "
                                              "that Lightroom (or Camera Raw) renders the DNG with Sony's "
                                              "colour and tone curve, and sets the exposure to match IDC's. "
@@ -6211,46 +8836,46 @@ class ExportDialog(QDialog):
                                 "defringe are left to the raw converter."))
 
         v = page("png")
-        self.sl_png = ParamSlider("Compression effort", 1, 9, 6)
+        self.sl_png = slider("Compression effort", 1, 9, 6)
         v.addWidget(self.sl_png)
         v.addWidget(muted_label("PNG is always lossless. Higher effort = smaller file, slower to save."))
 
         v = page("jpeg")
-        self.sl_jpeg = ParamSlider("Quality", 1, 100, 92)
+        self.sl_jpeg = slider("Quality", 1, 100, 92)
         v.addWidget(self.sl_jpeg)
         self.cmb_sub = combo([("4:4:4", "4:4:4  (full colour detail, larger)"), ("4:2:2", "4:2:2"),
                               ("4:2:0", "4:2:0  (smallest)")])
-        v.addLayout(labelled_row("Colour detail", self.cmb_sub))
+        row(v, "Colour detail", self.cmb_sub)
         self.sw_prog = SwitchRow("Progressive (loads in passes on the web)")
         v.addWidget(self.sw_prog)
 
         v = page("webp")
-        self.sl_webp = ParamSlider("Quality", 1, 100, 90)
+        self.sl_webp = slider("Quality", 1, 100, 90)
         v.addWidget(self.sl_webp)
-        self.sl_webp_effort = ParamSlider("Effort", 0, 6, 4,
-                                          tip="Higher = smaller file at the same quality, slower to save")
+        self.sl_webp_effort = slider("Effort", 0, 6, 4,
+                                     tip="Higher = smaller file at the same quality, slower to save")
         v.addWidget(self.sl_webp_effort)
         self.sw_webp_lossless = SwitchRow("Lossless")
         v.addWidget(self.sw_webp_lossless)
         v.addWidget(muted_label("WebP is 8-bit, and halves the colour resolution (4:2:0) when lossy."))
 
         v = page("avif")
-        self.sl_avif = ParamSlider("Quality", 1, 100, 80)
+        self.sl_avif = slider("Quality", 1, 100, 80)
         v.addWidget(self.sl_avif)
-        self.sl_avif_speed = ParamSlider("Speed", 0, 10, 6,
-                                         tip="Lower = smaller file at the same quality, much slower to save")
+        self.sl_avif_speed = slider("Speed", 0, 10, 6,
+                                    tip="Lower = smaller file at the same quality, much slower to save")
         v.addWidget(self.sl_avif_speed)
         self.cmb_avif_sub = combo([("4:4:4", "4:4:4  (full colour detail)"), ("4:2:0", "4:2:0  (smaller)")])
-        v.addLayout(labelled_row("Colour detail", self.cmb_avif_sub))
+        row(v, "Colour detail", self.cmb_avif_sub)
         v.addWidget(muted_label("AVIF gives the smallest files at a given quality but is slow to encode."
                                 + ("" if _ic_has("AVIF") else "  10 and 12-bit need the optional "
                                                              "'imagecodecs' package.")))
 
         v = page("jxl")
-        self.sl_jxl = ParamSlider("Quality", 1, 100, 90, tip="90 looks the same as the original for most "
-                                                             "pictures; 100 is near-lossless")
+        self.sl_jxl = slider("Quality", 1, 100, 90, tip="90 looks the same as the original for most "
+                                                        "pictures; 100 is near-lossless")
         v.addWidget(self.sl_jxl)
-        self.sl_jxl_effort = ParamSlider("Effort", 1, 9, 7, tip="Higher = smaller file, slower to save")
+        self.sl_jxl_effort = slider("Effort", 1, 9, 7, tip="Higher = smaller file, slower to save")
         v.addWidget(self.sl_jxl_effort)
         self.sw_jxl_lossless = SwitchRow("Lossless")
         v.addWidget(self.sw_jxl_lossless)
@@ -6258,16 +8883,16 @@ class ExportDialog(QDialog):
                                 "Lightroom, macOS and iOS open it; some older programs do not."))
 
         v = page("heif")
-        self.sl_heif = ParamSlider("Quality", 1, 100, 85)
+        self.sl_heif = slider("Quality", 1, 100, 85)
         v.addWidget(self.sl_heif)
         self.cmb_heif_sub = combo([("4:2:0", "4:2:0  (what phones write)"), ("4:4:4", "4:4:4  (full colour detail)")])
-        v.addLayout(labelled_row("Colour detail", self.cmb_heif_sub))
+        row(v, "Colour detail", self.cmb_heif_sub)
         v.addWidget(muted_label("HEIF / HEIC is what iPhones save. 10-bit keeps smooth skies free of banding."))
 
         v = page("jp2")
-        self.sl_jp2 = ParamSlider("Quality", 20, 70, 45, suffix=" dB",
-                                  tip="Target signal-to-noise ratio: 40 dB is good, 50 dB is very hard to "
-                                      "tell from the original")
+        self.sl_jp2 = slider("Quality", 20, 70, 45, suffix=" dB",
+                             tip="Target signal-to-noise ratio: 40 dB is good, 50 dB is very hard to "
+                                 "tell from the original")
         v.addWidget(self.sl_jp2)
         self.sw_jp2_lossless = SwitchRow("Lossless")
         v.addWidget(self.sw_jp2_lossless)
@@ -6277,7 +8902,7 @@ class ExportDialog(QDialog):
 
         v = page("exr")
         self.cmb_exr = combo(EXR_COMPRESSIONS)
-        v.addLayout(labelled_row("Compression", self.cmb_exr))
+        row(v, "Compression", self.cmb_exr)
         v.addWidget(muted_label("OpenEXR stores linear light as floating point, for compositing, 3D and "
                                 "HDR work. Its colour space sets the primaries written into the file."))
 
@@ -6287,32 +8912,29 @@ class ExportDialog(QDialog):
         self.spin_target = spin(0, 1000000, 50, " KB", "Off",
                                 "Lossy formats: use the highest quality (up to the one set above) whose "
                                 "file fits in this size. Off: the quality as set.")
-        cl.addLayout(labelled_row("Fit in", self.spin_target))
-        left.addWidget(card)
+        row(cl, "Fit in", self.spin_target)
 
         # ---- size and sharpening ----
-        card, cl = make_card("Size and sharpening")
+        cl = self.section(col, "Size and sharpening")
         self.cmb_res = combo([("full", "Full: every pixel (8 MP), using the image's demosaic"),
                               ("half", "Half: 2x2 pixel binning, no interpolation, no moiré (2 MP)")])
-        cl.addLayout(labelled_row("Resolution", self.cmb_res))
+        row(cl, "Resolution", self.cmb_res)
         self.cmb_size_mode = combo(SIZE_MODES)
         self.spin_edge = spin(0, 20000, 100, " px", "Keep size",
                               "Shrink to this size. Nothing is ever enlarged, except by a percentage.")
-        cl.addLayout(labelled_row("Resize", pair(self.cmb_size_mode, self.spin_edge)))
+        row(cl, "Resize", pair(self.cmb_size_mode, self.spin_edge))
         self.cmb_resample = combo(RESAMPLE_MODES, "How pixels are combined when the picture is made smaller")
-        cl.addLayout(labelled_row("Resampling", self.cmb_resample))
+        row(cl, "Resampling", self.cmb_resample)
         self.cmb_sharpen = combo(SHARPEN_MODES)
         self.cmb_amount = combo(SHARPEN_AMOUNTS)
-        cl.addLayout(labelled_row("Sharpen for", pair(self.cmb_sharpen, self.cmb_amount)))
+        row(cl, "Sharpen for", pair(self.cmb_sharpen, self.cmb_amount))
         cl.addWidget(muted_label("Output sharpening runs after resizing, on brightness only, tuned for "
                                  "the screen or paper the picture is made for. The export preview shows it."))
-        left.addWidget(card)
-        left.addStretch(1)
 
         # ---- colour ----
-        card, cl = make_card("Colour space")
-        self.cmb_space = compact(QComboBox())
-        cl.addLayout(labelled_row("Convert to", self.cmb_space))
+        cl = self.section(col, "Colour space")
+        self.cmb_space = combo([])
+        row(cl, "Convert to", self.cmb_space)
         self.lbl_space = muted_label("")
         cl.addWidget(self.lbl_space)
         self.lbl_chain = muted_label("", mono=True)
@@ -6320,10 +8942,9 @@ class ExportDialog(QDialog):
         self.sw_icc = SwitchRow("Embed the matching ICC profile", True,
                                 "Without it, other programs have to guess the colour space (they assume sRGB)")
         cl.addWidget(self.sw_icc)
-        right.addWidget(card)
 
         # ---- metadata ----
-        card, cl = make_card("Metadata")
+        cl = self.section(col, "Metadata")
         self.sw_meta = SwitchRow("Copy EXIF from the raw file", True,
                                  "Camera, lens, exposure and date. Sony's private maker notes are left out "
                                  "because their internal pointers are only valid inside the .SRF.")
@@ -6334,55 +8955,48 @@ class ExportDialog(QDialog):
         cl.addWidget(self.sw_gps)
         self.spin_dpi = spin(0, 4800, 10, " ppi", "As in the raw file",
                              "Print resolution written into the file. It does not change the pixels.")
-        cl.addLayout(labelled_row("Print ppi", self.spin_dpi))
-        right.addWidget(card)
+        row(cl, "Print ppi", self.spin_dpi)
 
         # ---- destination ----
-        card, cl = make_card("Save to")
+        cl = self.section(col, "Save to")
         self.lbl_dest = muted_label("")
         cl.addWidget(self.lbl_dest)
-        row = QHBoxLayout()
-        self.btn_same = QPushButton("Next to each raw file")
-        self.btn_choose = QPushButton("Choose folder…")
-        row.addWidget(self.btn_same)
-        row.addWidget(self.btn_choose)
-        cl.addLayout(row)
+        self.btn_same = GlassButton("Next to each raw file", None, "btn")
+        self.btn_choose = GlassButton("Choose folder…", None, "btn")
+        r = hrow(self.btn_same, self.btn_choose, None)
+        r.setContentsMargins(0, 2, 0, 4)
+        cl.addLayout(r)
         self.edit_suffix = QLineEdit()
+        self.edit_suffix.setFixedHeight(28)
         self.edit_suffix.setPlaceholderText("optional, e.g.  _edit")
-        cl.addLayout(labelled_row("Name suffix", self.edit_suffix))
+        row(cl, "Name suffix", self.edit_suffix)
         self.sw_overwrite = SwitchRow("Replace files that already exist", False,
                                       "Off: a number is added to the name instead (DSC0001_1.tiff)")
         cl.addWidget(self.sw_overwrite)
-        right.addWidget(card)
-        right.addStretch(1)
+        col.addStretch(1)
 
-        # ---- estimate + buttons ----
-        row = QHBoxLayout()
-        self.btn_estimate = QPushButton("Estimate file size")
+        # ---- footer ----
+        self.lbl_estimate = SLabel("", "muted", wrap=True)
+        self.lbl_estimate.setMinimumWidth(200)
+        self.footer.addWidget(self.lbl_estimate, 1)
+        self.btn_estimate = GlassButton("Estimate file size", None, "btn")
         self.btn_estimate.setEnabled(estimate is not None)
-        self.lbl_estimate = muted_label("")
-        row.addWidget(self.btn_estimate, 0)
-        row.addWidget(self.lbl_estimate, 1)
-        lay.addLayout(row)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        self.btn_cancel = QPushButton("Cancel")
-        self.btn_ok = QPushButton("Save settings" if settings_only else "Export")
-        self.btn_ok.setObjectName("primary")
-        self.btn_ok.setDefault(True)
-        row.addWidget(self.btn_cancel)
-        row.addWidget(self.btn_ok)
-        lay.addLayout(row)
+        self.footer.addWidget(self.btn_estimate)
+        self.btn_cancel = GlassButton("Cancel", None, "btn")
+        self.footer.addWidget(self.btn_cancel)
+        self.btn_ok = GlassButton("Save settings" if settings_only else "Export", None, "pri")
+        self.btn_ok.setMinimumWidth(88)
+        self.footer.addWidget(self.btn_ok)
+        self.primary = self.btn_ok
 
         self._load(opts)
-        self.cmb_preset.currentIndexChanged.connect(self._preset_chosen)
         self.cmb_fmt.currentIndexChanged.connect(self._format_changed)
         self.cmb_bits.currentIndexChanged.connect(self._bits_changed)
         self.cmb_space.currentIndexChanged.connect(self._space_changed)
         self.cmb_size_mode.currentIndexChanged.connect(self._size_mode_changed)
         for wdg in (self.sw_webp_lossless, self.sw_jxl_lossless, self.sw_jp2_lossless, self.sw_meta):
             wdg.toggled.connect(self._refresh_notes)
-        for wdg in (self.cmb_exr, self.cmb_sharpen, self.cmb_res):
+        for wdg in (self.cmb_exr, self.cmb_sharpen, self.cmb_res, self.cmb_dng_look):
             wdg.currentIndexChanged.connect(self._refresh_notes)
         self.spin_edge.valueChanged.connect(self._refresh_notes)
         self.btn_same.clicked.connect(self._use_same_folder)
@@ -6390,6 +9004,17 @@ class ExportDialog(QDialog):
         self.btn_estimate.clicked.connect(self._run_estimate)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_ok.clicked.connect(self.accept)
+        # any change: the preset highlight goes, the summary follows
+        for wdg in self.findChildren(ParamSlider):
+            wdg.changed.connect(self._touched)
+        for wdg in self.findChildren(SwitchRow):
+            wdg.toggled.connect(self._touched)
+        for wdg in self.findChildren(QComboBox):
+            wdg.currentIndexChanged.connect(self._touched)
+        for wdg in self.findChildren(QSpinBox):
+            wdg.valueChanged.connect(self._touched)
+        self.edit_suffix.textChanged.connect(self._touched)
+        self._touched()
 
     @staticmethod
     def _select(combo, data):
@@ -6398,6 +9023,7 @@ class ExportDialog(QDialog):
 
     def _load(self, o):
         quiet = (self.cmb_fmt, self.cmb_bits, self.cmb_space, self.cmb_size_mode, self.spin_edge)
+        self._loading = True
         for wdg in quiet:
             wdg.blockSignals(True)
         try:
@@ -6448,7 +9074,8 @@ class ExportDialog(QDialog):
         finally:
             for wdg in quiet:
                 wdg.blockSignals(False)
-        self.stack.setCurrentIndex(self._pages[self.cmb_fmt.currentData()])
+            self._loading = False
+        self._show_page(self._pages[self.cmb_fmt.currentData()])
         self._refresh_notes()
 
     def _fill_bits(self):
@@ -6480,7 +9107,7 @@ class ExportDialog(QDialog):
     def _format_changed(self, *_):
         self._fill_bits()
         self._fill_spaces()
-        self.stack.setCurrentIndex(self._pages[self.cmb_fmt.currentData()])
+        self._show_page(self._pages[self.cmb_fmt.currentData()])
         self._refresh_notes()
 
     def _bits_changed(self, *_):
@@ -6507,10 +9134,7 @@ class ExportDialog(QDialog):
         self.spin_edge.blockSignals(False)
         self._refresh_notes()
 
-    def _preset_chosen(self, index):
-        i = self.cmb_preset.itemData(index)
-        if i is None or i < 0:
-            return
+    def _preset_chosen(self, i):
         o = self.options()
         for key, value in EXPORT_PRESETS[i][1].items():
             setattr(o, key, value)
@@ -6518,9 +9142,20 @@ class ExportDialog(QDialog):
             o.dng_look = "none"
         self._base = o.copy()
         self._load(o)
-        self.cmb_preset.blockSignals(True)
-        self.cmb_preset.setCurrentIndex(0)           # a starting point, not a mode: edits are welcome
-        self.cmb_preset.blockSignals(False)
+        self._preset_on = i
+        self._preset_opts = self.options()          # a starting point, not a mode: edits are welcome
+        self._touched()
+
+    def _touched(self, *_):
+        if self._loading:
+            return
+        o = self.options()
+        if self._preset_on >= 0 and self._preset_opts is not None and o.__dict__ != self._preset_opts.__dict__:
+            self._preset_on = -1
+        for i, b in enumerate(self._preset_buttons):
+            b.setChecked(i == self._preset_on)
+        self._estimate_text = ""
+        self.lbl_estimate.setText(export_summary(o))
 
     def _refresh_notes(self, *_):
         o = self.options()
@@ -6572,7 +9207,7 @@ class ExportDialog(QDialog):
                                    "> camera Y / colour-difference stage\n"
                                    f"> sRGB > {COLOR_SPACES[key]['label']} primaries > {curve}")
         self.lbl_dest.setText(self._out_dir if self._out_dir else "Next to each raw file")
-        self.lbl_estimate.setText("")
+        self._touched()
 
     def _use_same_folder(self, *_):
         self._out_dir = ""
@@ -6646,38 +9281,48 @@ class ExportDialog(QDialog):
         return o
 
 
-class SyncDialog(QDialog):
+class PresetsBackground(QWidget):
+    """The darker column the export presets sit in."""
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        path = QPainterPath()
+        path.moveTo(r.topLeft())
+        path.lineTo(r.topRight())
+        path.lineTo(r.bottomRight())
+        path.lineTo(r.left() + 20, r.bottom())
+        path.quadTo(r.bottomLeft(), QPointF(r.left(), r.bottom() - 20))
+        path.closeSubpath()
+        p.fillPath(path, black(0.2))
+        p.end()
+
+
+class SyncDialog(SheetDialog):
     """Choose which parts of the current image's edits are copied to the ticked images."""
 
     def __init__(self, parent, count):
-        super().__init__(parent)
-        self.setWindowTitle("Sync edits")
-        self.setMinimumWidth(400)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 18, 20, 18)
-        lay.setSpacing(12)
-        head = QLabel(f"Copy this image's edits to {count} ticked image{'s' if count != 1 else ''}")
-        head.setObjectName("h1")
-        head.setWordWrap(True)
-        lay.addWidget(head)
-        card, cl = make_card("What to copy")
+        super().__init__(parent, f"Copy this image's edits to {count} ticked image{'s' if count != 1 else ''}",
+                         440)
+        col = self.scroll_column()
+        cl = self.section(col, "What to copy")
         self._rows = []
         for label, _fields in SYNC_GROUPS:
             row = SwitchRow(label, not label.startswith("Crop"))
             self._rows.append((label, row))
             cl.addWidget(row)
-        cl.addWidget(muted_label("'As shot' and 'Auto' white balance are re-measured for every image "
-                                 "rather than copied as a fixed Kelvin value."))
-        lay.addWidget(card)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        cancel = QPushButton("Cancel")
-        ok = QPushButton("Sync")
-        ok.setObjectName("primary")
-        ok.setDefault(True)
-        row.addWidget(cancel)
-        row.addWidget(ok)
-        lay.addLayout(row)
+        cl.addWidget(muted_label("'As shot' and 'Auto' white balance are measured again for every image "
+                                 "rather than copied as a fixed Kelvin value. Sections you have turned off "
+                                 "are copied as off."))
+        col.addStretch(1)
+        self.footer.addStretch(1)
+        cancel = GlassButton("Cancel", None, "btn")
+        ok = GlassButton("Sync", None, "pri")
+        ok.setMinimumWidth(88)
+        self.footer.addWidget(cancel)
+        self.footer.addWidget(ok)
+        self.primary = ok
         cancel.clicked.connect(self.reject)
         ok.clicked.connect(self.accept)
 
@@ -6686,8 +9331,153 @@ class SyncDialog(QDialog):
 
 
 # ---------------------------------------------------------------------
-# Main window
+# Window chrome: separators, the draggable title strip, resize grips,
+# the library list
 # ---------------------------------------------------------------------
+
+class GSep(QWidget):
+    """The faint vertical line between button sets in a top bar group."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(7, 18)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        g = QLinearGradient(QPointF(0, 0), QPointF(0, 18))
+        g.setColorAt(0, white(0.0))
+        g.setColorAt(0.5, white(0.3))
+        g.setColorAt(1, white(0.0))
+        p.fillRect(QRectF(3, 0, 1, 18), QBrush(g))
+        p.end()
+
+
+class TitleBar(QWidget):
+    """The strip along the top: its empty parts move the window, a double-click maximises it."""
+
+    def mousePressEvent(self, e):
+        win = self.window()
+        if e.button() == Qt.MouseButton.LeftButton and getattr(win, "frameless", False):
+            handle = win.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+
+    def mouseDoubleClickEvent(self, e):
+        win = self.window()
+        if e.button() == Qt.MouseButton.LeftButton and getattr(win, "frameless", False):
+            win.toggle_maximized()
+
+
+class Grip(QWidget):
+    """An invisible strip along the window edge that resizes the window."""
+
+    def __init__(self, win, edges, cursor):
+        super().__init__(win)
+        self.edges = edges
+        self.setCursor(QCursor(cursor))
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None:
+                handle.startSystemResize(self.edges)
+
+    def paintEvent(self, _e):
+        pass
+
+
+def _is_checked(value):
+    if value is None:
+        return False
+    return value in (Qt.CheckState.Checked, 2) or getattr(value, "value", None) == 2
+
+
+class LibraryDelegate(QStyledItemDelegate):
+    """One row of the library: tick box, thumbnail, name."""
+    ROW = 52
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+
+    def sizeHint(self, opt, index):
+        return QSize(200, self.ROW + 3)
+
+    @staticmethod
+    def _check_rect(rect):
+        return QRectF(rect.x() + 9, rect.center().y() - 7.5, 16, 16)
+
+    def paint(self, p, opt, index):
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        r = QRectF(opt.rect).adjusted(0, 1.5, 0, -1.5)
+        cur = index == self.view.currentIndex()
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        hover = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+        path = rounded(r, 8.0)
+        if cur:
+            paint_small_shadow(p, path, 2.0, 0.35)
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())
+            g.setColorAt(0, white(0.2))
+            g.setColorAt(1, white(0.11))
+            p.fillPath(path, QBrush(g))
+        elif sel:
+            p.fillPath(path, white(0.12))
+        elif hover:
+            p.fillPath(path, white(0.07))
+        cb = self._check_rect(opt.rect)
+        cpath = rounded(cb, 4.0)
+        if _is_checked(index.data(Qt.ItemDataRole.CheckStateRole)):
+            p.fillPath(cpath, accent())
+            pen = QPen(QColor("#ffffff"), 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline(QPolygonF([QPointF(cb.x() + 3.8, cb.y() + 8.3), QPointF(cb.x() + 6.8, cb.y() + 11.3),
+                                      QPointF(cb.x() + 12.3, cb.y() + 4.8)]))
+        else:
+            p.fillPath(cpath, black(0.35))
+            p.setPen(QPen(white(0.45), 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(rounded(cb.adjusted(0.5, 0.5, -0.5, -0.5), 3.5))
+        th = QRectF(cb.right() + 10, r.center().y() - 21, 56, 42)
+        tpath = rounded(th, 2.0)
+        paint_small_shadow(p, tpath, 2.0, 0.55, steps=3)
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        pix = icon.pixmap(QSize(160, 120)) if isinstance(icon, QIcon) and not icon.isNull() else None
+        if pix is not None and not pix.isNull():
+            p.save()
+            p.setClipPath(tpath)
+            pw, ph = float(pix.width()), float(pix.height())
+            s = max(th.width() / pw, th.height() / ph)
+            tw, tht = pw * s, ph * s
+            p.drawPixmap(QRectF(th.center().x() - tw / 2, th.center().y() - tht / 2, tw, tht), pix,
+                         QRectF(0, 0, pw, ph))
+            p.restore()
+        else:
+            p.fillPath(tpath, white(0.08))
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        f = ui_font(12.5, 600 if cur else 400)
+        tr = QRectF(th.right() + 10, r.y(), r.right() - th.right() - 18, r.height())
+        text = QFontMetricsF(f).elidedText(text, Qt.TextElideMode.ElideRight, tr.width())
+        draw_text(p, tr, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text, "#f0f0f3", 0.4, f)
+        p.restore()
+
+    def editorEvent(self, event, model, opt, index):
+        t = event.type()
+        if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick):
+            if (event.button() == Qt.MouseButton.LeftButton and
+                    self._check_rect(opt.rect).adjusted(-6, -8, 6, 8).contains(event.position())):
+                if t == QEvent.Type.MouseButtonRelease:
+                    on = _is_checked(index.data(Qt.ItemDataRole.CheckStateRole))
+                    model.setData(index, (Qt.CheckState.Unchecked if on else Qt.CheckState.Checked).value,
+                                  Qt.ItemDataRole.CheckStateRole)
+                return True
+        return False
+
 
 # ---------------------------------------------------------------------
 # Background threads
@@ -6790,28 +9580,184 @@ class ExportThread(QThread):
             self.finished_all.emit(done, errors)
 
 
-class Entry:
-    """One raw file in the library and its (non-destructive) edits."""
+# ---------------------------------------------------------------------
+# Develop sections and defaults
+# ---------------------------------------------------------------------
 
-    def __init__(self, path):
+class Entry:
+    """One raw file in the library, its (non-destructive) edits, which Develop
+    sections are switched off, and its undo history."""
+
+    def __init__(self, path, edit=None):
         self.path = path
-        self.edit = Edit()
+        self.edit = edit if edit is not None else Edit()
         self.edited = False
+        self.off = set()
+        self.history = []
+        self.hpos = -1
 
 
 ASPECTS = [("Free", None), ("Original", "original"), ("1 : 1", 1.0), ("4 : 3", 4 / 3), ("3 : 2", 3 / 2),
            ("16 : 9", 16 / 9), ("5 : 4", 5 / 4), ("3 : 4  (portrait)", 3 / 4), ("2 : 3  (portrait)", 2 / 3),
            ("9 : 16  (portrait)", 9 / 16), ("4 : 5  (portrait)", 4 / 5)]
 
+SECTION_FIELDS = {
+    "colour": ("render", "sony_curve"),
+    "wb": ("wb_preset", "temp", "tint"),
+    "light": ("exposure", "black_point", "rolloff", "highlights", "ir"),
+    "crop": ("rot_k", "flip", "straighten", "crop"),
+    "lens": ("ca_red", "ca_blue", "defringe"),
+    "noise": ("chroma_nr",),
+    "sensor": ("demosaic", "hot_pixels", "black_mode"),
+}
+DEFAULT_FIELDS = ("render", "sony_curve", "wb_preset", "temp", "tint", "exposure", "black_point", "rolloff",
+                  "highlights", "ir", "black_mode", "demosaic", "hot_pixels", "ca_red", "ca_blue", "chroma_nr",
+                  "defringe")
+# v21's defaults for new images: Sony 'Real' colour, as-shot white balance, the edge-aware
+# demosaic and the camera's own black level; everything else off or neutral.
+BUILTIN_DEFAULTS = {"render": "sony", "sony_curve": "real", "wb_preset": "asshot", "demosaic": "guided",
+                    "black_mode": "camera", "rolloff": False}
+COLOUR_MODES = [("Sony Real", "real"), ("Sony Standard", "standard"), ("Adobe-style", "adobe")]
+CARDS_OPEN_DEFAULT = {"colour": True, "wb": True, "light": True, "crop": False, "lens": False, "noise": False,
+                      "sensor": False, "info": False}
+
+
+def clean_defaults(d):
+    """Keep only valid develop fields from stored defaults."""
+    base = Edit()
+    out = {}
+    if not isinstance(d, dict):
+        return out
+    for k, v in d.items():
+        if k not in DEFAULT_FIELDS:
+            continue
+        ref = getattr(base, k)
+        if k in ("temp", "tint"):
+            if v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)):
+                out[k] = None if v is None else float(v)
+        elif isinstance(ref, bool):
+            if isinstance(v, bool):
+                out[k] = v
+        elif isinstance(ref, float):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = float(v)
+        elif isinstance(ref, int):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = int(v)
+        elif isinstance(ref, str) and isinstance(v, str):
+            out[k] = v
+    choices = {"render": ("default", "sony"), "sony_curve": tuple(_SONY_CURVE_Y),
+               "wb_preset": tuple(key for _, key, _ in WB_PRESETS),
+               "black_mode": tuple(key for _, key in BLACK_MODES),
+               "demosaic": tuple(key for _, key in DEMOSAIC_MODES if key != "idc" or idc_demosaic_available())}
+    for k, allowed in choices.items():
+        if k in out and out[k] not in allowed:
+            del out[k]
+    if out.get("wb_preset", "asshot") != "custom":
+        out.pop("temp", None)
+        out.pop("tint", None)
+    for k, lo, hi in (("exposure", -5.0, 5.0), ("black_point", 0, 500), ("ca_red", -60.0, 60.0),
+                      ("ca_blue", -60.0, 60.0), ("chroma_nr", 0, 100), ("defringe", 0, 100),
+                      ("temp", TEMP_MIN, TEMP_MAX), ("tint", TINT_MIN, TINT_MAX)):
+        if out.get(k) is not None:
+            out[k] = type(out[k])(min(max(out[k], lo), hi))
+    return out
+
+
+def edit_from_defaults(defaults):
+    e = Edit()
+    for k, v in defaults.items():
+        setattr(e, k, v)
+    if e.demosaic == "idc" and not idc_demosaic_available():
+        e.demosaic = "guided"
+    return e
+
+
+def build_stylesheet():
+    arrow = _arrow_image_path()
+    a = APPEARANCE["accent"]
+    # Qt 6.12 squeezes the text field of a spin box without buttons to 1 px when a style sheet
+    # sets its padding, so every number box shows blank. Anchoring the hidden buttons to the
+    # border gives the text its width back (with less left padding). Earlier Qt needs nothing.
+    qt = tuple(int(p) for p in qVersion().split(".")[:2])
+    spin_fix = ("QAbstractSpinBox::up-button, QAbstractSpinBox::down-button "
+                "{ width: 0px; subcontrol-origin: border; }" if qt >= (6, 12) else "")
+    return f"""
+    QWidget {{ color: {TEXT}; font-size: 13px; }}
+    QToolTip {{ background: #1c1c20; color: {TEXT}; border: 1px solid rgba(255,255,255,40); padding: 4px 8px; }}
+    QLabel {{ background: transparent; }}
+    QScrollArea {{ background: transparent; border: none; }}
+    QScrollArea > QWidget > QWidget {{ background: transparent; }}
+    QComboBox {{ background: rgba(0,0,0,92); border: none; border-top: 1px solid rgba(0,0,0,110);
+        border-bottom: 1px solid rgba(255,255,255,20); border-radius: 7px; padding: 0 8px; color: #f0f0f3; }}
+    QComboBox:hover {{ background: rgba(0,0,0,115); }}
+    QComboBox:focus {{ border: 1px solid {a}; }}
+    QComboBox:disabled {{ color: rgba(240,240,243,100); }}
+    QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right; width: 24px; border: none; }}
+    QComboBox::down-arrow {{ image: url("{arrow}"); width: 10px; height: 6px; }}
+    QComboBox QAbstractItemView {{ background: #222226; border: 1px solid rgba(255,255,255,30);
+        selection-background-color: {a}; selection-color: #ffffff; outline: none; padding: 4px; }}
+    QLineEdit, QAbstractSpinBox {{ background: rgba(0,0,0,92); border: none; border-top: 1px solid rgba(0,0,0,110);
+        border-bottom: 1px solid rgba(255,255,255,20); border-radius: 7px; padding: 0 8px; color: #f0f0f3;
+        selection-background-color: {a}; }}
+    QLineEdit:focus, QAbstractSpinBox:focus {{ border: 1px solid {a}; }}
+    QLineEdit:disabled, QAbstractSpinBox:disabled {{ color: rgba(240,240,243,100); }}
+    QLineEdit#val {{ background: transparent; border: none; border-radius: 5px; padding: 0 3px; }}
+    QLineEdit#val:hover {{ background: rgba(255,255,255,20); }}
+    QLineEdit#val:focus {{ background: rgba(0,0,0,128); border: 1px solid {a}; }}
+    {spin_fix}
+    QListWidget {{ background: transparent; border: none; outline: none; }}
+    QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
+    QScrollBar::handle:vertical {{ background: rgba(255,255,255,56); border-radius: 2px; min-height: 30px; }}
+    QScrollBar::handle:vertical:hover {{ background: rgba(255,255,255,90); }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+    QScrollBar:horizontal {{ height: 0px; }}
+    QMessageBox {{ background: #1b1b1f; }}
+    QMessageBox QPushButton {{ background: rgba(255,255,255,30); border: none; border-radius: 7px;
+        padding: 6px 14px; min-width: 64px; }}
+    QMessageBox QPushButton:hover {{ background: rgba(255,255,255,50); }}
+    """
+
+
+def _arrow_image_path():
+    """Small chevron for combo boxes (Qt style sheets need it as an image file)."""
+    path = os.path.join(tempfile.gettempdir(), "f828_converter_chevron.png")
+    try:
+        pix = QPixmap(20, 12)
+        pix.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(240, 240, 243, 220), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline(QPolygonF([QPointF(4.0, 3.0), QPointF(10.0, 9.0), QPointF(16.0, 3.0)]))
+        p.end()
+        pix.save(path, "PNG")
+    except Exception:
+        pass
+    return path.replace("\\", "/")
+
+
+# ---------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------
 
 class MainWindow(QWidget):
+    LIB_W, DEV_W, TOP, GAP, STRIP_H = 268, 332, 50, 6, 60
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Sony F828 RGBE Converter (v{APP_VERSION})")
-        self.resize(1500, 930)
-        self.setMinimumSize(1240, 700)
-        self.setAcceptDrops(True)
         self.settings = QSettings("F828Converter", "F828Converter")
+        self._load_appearance()
+        self.frameless = not APPEARANCE.get("native_frame", False)
+        if self.frameless:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setWindowTitle(f"F828 Converter (v{APP_VERSION})")
+        self.resize(1500, 930)
+        self.setMinimumSize(1100, 680)
+        self.setAcceptDrops(True)
 
         self.entries = {}                # path -> Entry
         self.items = {}                  # path -> QListWidgetItem
@@ -6819,6 +9765,7 @@ class MainWindow(QWidget):
         self.sensor = None
         self.meta = None
         self.edit = Edit()
+        self._eff = self.edit            # the edit as rendered (sections switched off, Before)
         self._quarter = None             # 25% RGBE frame of the open image (DN)
         self._shown = None               # the picture currently on screen
         self._shown_level = None         # ... and the preview level it was rendered at
@@ -6829,8 +9776,14 @@ class MainWindow(QWidget):
         self._loading = False
         self._loading_proof = False
         self._shown_proof = None         # what the export preview reported for the picture on screen
-        self._backdrop, self._backdrop_size = None, None
-        self.preview_level = "half"
+        self.before_on = False
+        level = str(self.settings.value("preview_level_v21", "full") or "full")
+        self.preview_level = level if level in RESOLUTION_SCALE else "full"
+        self.draft_on = str(self.settings.value("draft_v21", "true")).lower() != "false"
+        self.lib_open = str(self.settings.value("library_open", "true")).lower() != "false"
+        self.dev_open = str(self.settings.value("develop_open", "true")).lower() != "false"
+        self.user_defaults = self._load_user_defaults()
+        self.cards_open = self._load_json("cards_open_v21", CARDS_OPEN_DEFAULT)
         self.export_opts = self._load_export_options()
 
         self.renderer = PreviewRenderer()            # only ever used on the preview thread
@@ -6840,425 +9793,65 @@ class MainWindow(QWidget):
         self.thumb_worker = Worker(parent=self)
         self.thumb_worker.done.connect(self._thumb_done)
         self._export_thread = None
-        self._export_dialog = None
 
         self._refine = QTimer(self)                  # waits for a pause in slider movement
         self._refine.setSingleShot(True)
         self._refine.setInterval(160)
         self._refine.timeout.connect(self._refine_now)
+        self._history_timer = QTimer(self)           # one undo step per pause in editing
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(450)
+        self._history_timer.timeout.connect(self._commit_history)
 
         self._build_ui()
         self._connect()
+        self.edit = self._eff = self._new_edit()
         self._load_controls()
         self._update_enabled()
         self._update_counts()
-
-    # ------------------------------------------------------------ backdrop
-    def _paint_backdrop(self, w, h):
-        """The dark, softly coloured background the glass panels sit on. Painted
-        once per window size and then reused, so panning the picture stays cheap."""
-        pix = QPixmap(max(1, w), max(1, h))
-        p = QPainter(pix)
-        area = QRectF(0.0, 0.0, float(w), float(h))
-        base = QLinearGradient(0.0, 0.0, 0.0, float(h))
-        base.setColorAt(0.0, QColor(22, 24, 33))
-        base.setColorAt(1.0, QColor(9, 10, 14))
-        p.fillRect(area, QBrush(base))
-        for fx, fy, fr, rgb in ((0.08, 0.10, 0.50, (10, 132, 255)), (0.95, 0.20, 0.45, (175, 82, 222)),
-                                (0.62, 1.05, 0.55, (48, 209, 188)), (0.02, 0.95, 0.38, (255, 149, 0))):
-            glow = QRadialGradient(QPointF(w * fx, h * fy), max(w, h) * fr)
-            glow.setColorAt(0.0, QColor(rgb[0], rgb[1], rgb[2], 70))
-            glow.setColorAt(1.0, QColor(rgb[0], rgb[1], rgb[2], 0))
-            p.fillRect(area, QBrush(glow))
-        p.end()
-        return pix
-
-    def paintEvent(self, _event):
-        size = (int(self.width()), int(self.height()))
-        if self._backdrop is None or self._backdrop_size != size:
-            self._backdrop, self._backdrop_size = self._paint_backdrop(*size), size
-        p = QPainter(self)
-        p.drawPixmap(0, 0, self._backdrop)
-        p.end()
-
-    # ------------------------------------------------------------ construction
-    def _build_ui(self):
-        root = QHBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
-        split = QSplitter(Qt.Orientation.Horizontal)
-        split.setHandleWidth(12)
-        split.setChildrenCollapsible(False)
-        root.addWidget(split)
-        split.addWidget(self._build_library())
-        self.viewer = ViewerArea()
-        self.view = self.viewer.view
-        split.addWidget(self.viewer)
-        split.addWidget(self._build_inspector())
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        split.setStretchFactor(2, 0)
-        split.setSizes([270, 870, 350])
-
-    def _build_library(self):
-        panel = QFrame()
-        panel.setObjectName("glass")
-        panel.setMinimumWidth(240)
-        panel.setMaximumWidth(400)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(14, 14, 14, 14)
-        lay.setSpacing(10)
-        title = QLabel("Library")
-        title.setObjectName("h1")
-        lay.addWidget(title)
-        row = QHBoxLayout()
-        self.btn_add_files = QPushButton("Add files\u2026")
-        self.btn_add_folder = QPushButton("Add folder\u2026")
-        row.addWidget(self.btn_add_files)
-        row.addWidget(self.btn_add_folder)
-        lay.addLayout(row)
-        self.sw_subfolders = SwitchRow("Include subfolders", False)
-        lay.addWidget(self.sw_subfolders)
-        self.edit_filter = QLineEdit()
-        self.edit_filter.setPlaceholderText("Filter by name")
-        self.edit_filter.setClearButtonEnabled(True)
-        lay.addWidget(self.edit_filter)
-        self.list = QListWidget()
-        self.list.setIconSize(QSize(76, 57))
-        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        lay.addWidget(self.list, 1)
-        self.lbl_count = muted_label("")
-        lay.addWidget(self.lbl_count)
-        row = QHBoxLayout()
-        self.btn_check_all = QPushButton("Tick all")
-        self.btn_check_none = QPushButton("Untick all")
-        self.btn_remove = QPushButton("Remove")
-        self.btn_remove.setToolTip("Remove the highlighted images from this list (files are not deleted)")
-        for b in (self.btn_check_all, self.btn_check_none, self.btn_remove):
-            row.addWidget(b)
-        lay.addLayout(row)
-        lay.addWidget(muted_label("Click an image to edit it. Tick images to include them in "
-                                  "batch export and sync."))
-        return panel
-
-    def _build_inspector(self):
-        panel = QFrame()
-        panel.setObjectName("glass")
-        panel.setMinimumWidth(330)
-        panel.setMaximumWidth(440)
-        outer = QVBoxLayout(panel)
-        outer.setContentsMargins(8, 14, 8, 14)
-        outer.setSpacing(10)
-        head = QHBoxLayout()
-        head.setContentsMargins(8, 0, 8, 0)
-        title = QLabel("Develop")
-        title.setObjectName("h1")
-        self.btn_reset = QPushButton("Reset edits")
-        head.addWidget(title, 1)
-        head.addWidget(self.btn_reset, 0)
-        outer.addLayout(head)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.viewport().setAutoFillBackground(False)
-        inner = QWidget()
-        inner.setObjectName("clear")
-        col = QVBoxLayout(inner)
-        col.setContentsMargins(6, 0, 6, 0)
-        col.setSpacing(10)
-
-        # histogram
-        card, cl = make_card("Histogram")
-        self.histogram = Histogram()
-        cl.addWidget(self.histogram)
-        col.addWidget(card)
-
-        # white balance
-        card, cl = make_card("White balance")
-        self.cmb_wb = compact(QComboBox())
-        for label, key, _tt in WB_PRESETS:
-            self.cmb_wb.addItem(label, key)
-        self.cmb_wb.setToolTip("With Sony colour, Daylight, Cloudy, Shade, Tungsten, Fluorescent and Flash "
-                               "are Image Data Converter's own presets, exactly as it applies them.")
-        self.btn_auto_wb = QPushButton("Auto")
-        self.btn_auto_wb.setToolTip("Estimate the light from the picture itself")
-        row = QHBoxLayout()
-        row.addWidget(self.cmb_wb, 1)
-        row.addWidget(self.btn_auto_wb, 0)
-        cl.addLayout(row)
-        mired_lo, mired_hi = 1e6 / TEMP_MAX, 1e6 / TEMP_MIN
-        self.sl_temp = ParamSlider(
-            "Temperature", TEMP_MIN, TEMP_MAX, D65_TEMP_TINT[0], step=10.0, suffix=" K", style="temp",
-            positions=900,
-            to_value=lambda f: 1e6 / (mired_hi - (mired_hi - mired_lo) * f),
-            to_frac=lambda v: (mired_hi - 1e6 / v) / (mired_hi - mired_lo),
-            tip="Colour temperature of the light, in Kelvin. Left = cooler picture, right = warmer.")
-        cl.addWidget(self.sl_temp)
-        self.sl_tint = ParamSlider("Tint", TINT_MIN, TINT_MAX, D65_TEMP_TINT[1], step=1.0, style="tint",
-                                   tip="Left = greener picture, right = more magenta.")
-        cl.addWidget(self.sl_tint)
-        self.lbl_asshot = muted_label("")
-        cl.addWidget(self.lbl_asshot)
-        col.addWidget(card)
-
-        # colour rendering
-        card, cl = make_card("Colour")
-        self.sw_sony = SwitchRow(
-            "Sony 'Real' colour (Image Data Converter)", False,
-            "Off: the default rendering (Adobe-style colour matrix, sRGB curve, roll-off). "
-            "On: Sony's own rendering as Image Data Converter SR does it: the camera's colour "
-            "processor, set up from the registers stored in the .SRF (matrix, white balance, "
-            "tone curve and the per-shot 'Real' colour coefficients).")
-        cl.addWidget(self.sw_sony)
-        self.cmb_sony_curve = compact(QComboBox())
-        for text, key in SONY_CURVE_MODES:
-            self.cmb_sony_curve.addItem(text, key)
-        self.cmb_sony_curve.setToolTip("Which of the camera's two colour modes to reproduce. Use the one "
-                                       "the camera was set to (Real or Standard).")
-        cl.addLayout(labelled_row("Camera mode", self.cmb_sony_curve, 96))
-        self.lbl_render = muted_label("")
-        cl.addWidget(self.lbl_render)
-        col.addWidget(card)
-
-        # light
-        card, cl = make_card("Light")
-        self.sl_exp = ParamSlider("Exposure", -5.0, 5.0, 0.0, step=0.1, decimals=1, suffix=" EV", style="centered")
-        cl.addWidget(self.sl_exp)
-        self.sl_black = ParamSlider("Black point", 0, 500, 0, step=1.0,
-                                    tip="Neutral black point (equal in R, G and B). Double-click the name to reset.")
-        cl.addWidget(self.sl_black)
-        self.sw_rolloff = SwitchRow("Highlight soft roll-off", True)
-        cl.addWidget(self.sw_rolloff)
-        self.sw_highlights = SwitchRow(
-            "Highlight reconstruction", False,
-            "Rebuilds channels that hit the sensor's limit from the ones that did not, instead of "
-            "cutting everything at white. Gives the roll-off (or a lower exposure) real detail to "
-            "bring back. Fully blown areas stay white.")
-        cl.addWidget(self.sw_highlights)
-        self.sw_ir = SwitchRow("IR false colour (Aerochrome)", False)
-        cl.addWidget(self.sw_ir)
-        col.addWidget(card)
-
-        # lens
-        card, cl = make_card("Lens corrections")
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Chromatic aberration"), 1)
-        self.btn_auto_ca = QPushButton("Auto")
-        self.btn_auto_ca.setToolTip("Measure the colour fringing from the picture itself and correct it")
-        row.addWidget(self.btn_auto_ca, 0)
-        cl.addLayout(row)
-        self.sl_ca_red = ParamSlider(
-            "Red / cyan", -60.0, 60.0, 0.0, step=0.5, decimals=1, style="centered",
-            tip="Scales the red image against the green one, in 1/10000 of the frame. Removes red / cyan "
-                "fringes that grow towards the corners.")
-        cl.addWidget(self.sl_ca_red)
-        self.sl_ca_blue = ParamSlider(
-            "Blue / yellow", -60.0, 60.0, 0.0, step=0.5, decimals=1, style="centered",
-            tip="Scales the blue (and partly the emerald) image against the green one. Removes blue / "
-                "yellow fringes that grow towards the corners.")
-        cl.addWidget(self.sl_ca_blue)
-        self.lbl_ca = muted_label("")
-        cl.addWidget(self.lbl_ca)
-        self.sl_defringe = ParamSlider(
-            "Defringe", 0, 100, 0,
-            tip="Removes the purple (and green) fringes along high-contrast edges, such as branches or "
-                "window frames against a bright sky. Blue sky and purple objects away from such edges "
-                "are left alone.")
-        cl.addWidget(self.sl_defringe)
-        col.addWidget(card)
-
-        # noise
-        card, cl = make_card("Noise reduction")
-        self.sl_chroma_nr = ParamSlider(
-            "Colour noise", 0, 100, 0,
-            tip="Smooths the coloured speckles and blotches of noise, guided by the picture's own edges so "
-                "colours do not bleed. Brightness detail is left alone.")
-        cl.addWidget(self.sl_chroma_nr)
-        col.addWidget(card)
-
-        # geometry
-        card, cl = make_card("Crop and straighten")
-        self.cmb_aspect = compact(QComboBox())
-        for label, value in ASPECTS:
-            self.cmb_aspect.addItem(label, value)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.btn_ccw = QPushButton("\u21BA")
-        self.btn_ccw.setToolTip("Rotate 90\u00B0 left  (Shift+R)")
-        self.btn_cw = QPushButton("\u21BB")
-        self.btn_cw.setToolTip("Rotate 90\u00B0 right  (R)")
-        self.btn_fliph = QPushButton("\u2194")
-        self.btn_fliph.setToolTip("Mirror left-right")
-        self.btn_flipv = QPushButton("\u2195")
-        self.btn_flipv.setToolTip("Flip top-bottom")
-        for b in (self.btn_ccw, self.btn_cw, self.btn_fliph, self.btn_flipv):
-            b.setObjectName("glyph")
-            b.setMinimumWidth(40)
-            row.addWidget(b)
-        cl.addLayout(row)
-        cl.addLayout(labelled_row("Shape", self.cmb_aspect, 70))
-        self.sl_straighten = ParamSlider("Straighten", -20.0, 20.0, 0.0, step=0.1, decimals=1,
-                                         suffix="\u00B0", style="centered",
-                                         tip="Positive turns the picture clockwise. The crop shrinks "
-                                             "automatically so no empty corners show.")
-        cl.addWidget(self.sl_straighten)
-        row = QHBoxLayout()
-        self.btn_crop_tool = QPushButton("Edit crop")
-        self.btn_crop_tool.setCheckable(True)
-        self.btn_reset_crop = QPushButton("Reset")
-        row.addWidget(self.btn_crop_tool, 1)
-        row.addWidget(self.btn_reset_crop, 0)
-        cl.addLayout(row)
-        self.lbl_crop = muted_label("")
-        cl.addWidget(self.lbl_crop)
-        col.addWidget(card)
-
-        # sensor
-        card, cl = make_card("Sensor")
-        self.cmb_demosaic = compact(QComboBox())
-        for text, key in DEMOSAIC_MODES:
-            if key != "idc" or idc_demosaic_available():
-                self.cmb_demosaic.addItem(text, key)
-        self.cmb_demosaic.setToolTip(
-            "How the full-colour picture is rebuilt from the sensor's RGBE mosaic.\n"
-            "IDC: Sony Image Data Converter's own method, recreated. Smooth colour planes "
-            "with a sharp brightness taken from the green and emerald photosites, and colour removed "
-            "on the very hardest edges. With the Sony colour rendering it reproduces IDC's own files "
-            "to within 1/255. Least colour noise and no colour fringes on fine lines.\n"
-            "Edge-aware: follows edges in every colour. A little more fine detail than IDC, but more "
-            "colour noise and some colour fringing on fine lines.\n"
-            "Bilinear: v15's. The softest.")
-        cl.addLayout(labelled_row("Demosaic", self.cmb_demosaic, 80))
-        self.lbl_demosaic = muted_label("")
-        cl.addWidget(self.lbl_demosaic)
-        self._update_demosaic_note()
-        self.sw_hot = SwitchRow(
-            "Remove hot pixels", False,
-            "Replaces stuck bright (or dead dark) photosites with their neighbours before the demosaic. "
-            "Real points of light such as stars or glints are kept: they spread over photosites of "
-            "every colour, a hot pixel does not.")
-        cl.addWidget(self.sw_hot)
-        self.lbl_hot = muted_label("")
-        cl.addWidget(self.lbl_hot)
-        cl.addWidget(QLabel("Black level"))
-        self.cmb_black = compact(QComboBox())
-        for text, key in BLACK_MODES:
-            self.cmb_black.addItem(text, key)
-        cl.addWidget(self.cmb_black)
-        self.lbl_black_info = muted_label("", mono=True)
-        cl.addWidget(self.lbl_black_info)
-        col.addWidget(card)
-
-        # info
-        card, cl = make_card("Image info")
-        self.lbl_info = muted_label("No image loaded")
-        cl.addWidget(self.lbl_info)
-        col.addWidget(card)
-
-        col.addStretch(1)
-        scroll.setWidget(inner)
-        outer.addWidget(scroll, 1)
-
-        foot = QVBoxLayout()
-        foot.setContentsMargins(8, 0, 8, 0)
-        foot.setSpacing(8)
-        self.lbl_batch = muted_label("")
-        foot.addWidget(self.lbl_batch)
-        row = QHBoxLayout()
-        self.btn_sync = QPushButton("Sync edits to ticked\u2026")
-        self.btn_export_checked = QPushButton("Export ticked\u2026")
-        row.addWidget(self.btn_sync)
-        row.addWidget(self.btn_export_checked)
-        foot.addLayout(row)
-        self.btn_export = QPushButton("Export this image\u2026")
-        self.btn_export.setObjectName("primary")
-        foot.addWidget(self.btn_export)
-        outer.addLayout(foot)
-        return panel
-
-    def _connect(self):
-        v = self.viewer
-        self.btn_add_files.clicked.connect(self._add_files)
-        self.btn_add_folder.clicked.connect(self._add_folder)
-        self.edit_filter.textChanged.connect(self._apply_filter)
-        self.list.currentItemChanged.connect(self._current_item_changed)
-        self.list.itemChanged.connect(self._update_counts)
-        self.btn_check_all.clicked.connect(lambda *_: self._tick_all(True))
-        self.btn_check_none.clicked.connect(lambda *_: self._tick_all(False))
-        self.btn_remove.clicked.connect(self._remove_selected)
-
-        self.btn_reset.clicked.connect(self._reset_edits)
-        self.cmb_wb.currentIndexChanged.connect(self._wb_preset_changed)
-        self.btn_auto_wb.clicked.connect(lambda *_: self._apply_wb_preset("auto"))
-        self.sl_temp.changed.connect(self._temp_tint_changed)
-        self.sl_tint.changed.connect(self._temp_tint_changed)
-        self.sl_exp.changed.connect(self._tone_changed)
-        self.sl_black.changed.connect(self._tone_changed)
-        self.sw_rolloff.toggled.connect(self._tone_changed)
-        self.sw_highlights.toggled.connect(self._tone_changed)
-        self.sw_ir.toggled.connect(self._tone_changed)
-        self.sw_sony.toggled.connect(self._render_changed)
-        self.cmb_sony_curve.currentIndexChanged.connect(self._render_changed)
-        self.cmb_demosaic.currentIndexChanged.connect(self._demosaic_changed)
-        self.sw_hot.toggled.connect(self._hot_changed)
-        self.sl_ca_red.changed.connect(self._lens_changed)
-        self.sl_ca_blue.changed.connect(self._lens_changed)
-        self.btn_auto_ca.clicked.connect(self._auto_ca)
-        self.sl_defringe.changed.connect(self._detail_changed)
-        self.sl_chroma_nr.changed.connect(self._detail_changed)
-        self.cmb_black.currentIndexChanged.connect(self._black_mode_changed)
-        self.cmb_aspect.currentIndexChanged.connect(self._aspect_changed)
-        self.sl_straighten.changed.connect(self._straighten_changed)
-        self.btn_crop_tool.clicked.connect(lambda *_: self._set_tool("crop" if self.btn_crop_tool.isChecked() else "pan"))
-        self.btn_reset_crop.clicked.connect(self._reset_crop)
-
-        v.btn_pan.clicked.connect(lambda *_: self._set_tool("pan"))
-        v.btn_crop.clicked.connect(lambda *_: self._set_tool("crop"))
-        v.btn_pick.clicked.connect(lambda *_: self._set_tool("pick"))
-        self.btn_cw.clicked.connect(lambda *_: self._orient("cw"))
-        self.btn_ccw.clicked.connect(lambda *_: self._orient("ccw"))
-        self.btn_fliph.clicked.connect(lambda *_: self._orient("fliph"))
-        self.btn_flipv.clicked.connect(lambda *_: self._orient("flipv"))
-        v.btn_zoom_in.clicked.connect(lambda *_: self.view.zoom_step(+1))
-        v.btn_zoom_out.clicked.connect(lambda *_: self.view.zoom_step(-1))
-        v.btn_fit.clicked.connect(lambda *_: self.view.fit())
-        v.btn_100.clicked.connect(lambda *_: self.view.actual_size())
-        v.btn_clip.toggled.connect(self._request)
-        v.sl_res.valueChanged.connect(self._preview_level_changed)
-        v.sw_proof.toggled.connect(self._proof_toggled)
-        v.cmb_proof_fmt.currentIndexChanged.connect(self._proof_format_changed)
-        v.sl_proof_q.changed.connect(self._proof_quality_changed)
-        v.cmb_proof_view.currentIndexChanged.connect(lambda *_: self._request_proof())
-        v.btn_export_settings.clicked.connect(self._export_settings)
-        v.btn_full.clicked.connect(self._full_quality)
-        self.view.cropChanged.connect(self._crop_dragged)
-        self.view.cropFinished.connect(self._crop_finished)
-        self.view.pointPicked.connect(self._picked)
-        self.view.applyRequested.connect(lambda *_: self._set_tool("pan"))
-
-        v.sl_res.setValue([k for k, _, _ in RESOLUTIONS].index(self.preview_level))
-        self._sync_proof_controls()
-        self._preview_level_changed()
-
-        self.btn_sync.clicked.connect(self._sync)
-        self.btn_export.clicked.connect(lambda *_: self._export(False))
-        self.btn_export_checked.clicked.connect(lambda *_: self._export(True))
-
-        for keys, slot in (("Ctrl+O", self._add_files), ("Ctrl+Shift+O", self._add_folder),
-                           ("Ctrl+E", lambda: self._export(False)), ("Ctrl+Shift+E", lambda: self._export(True)),
-                           ("V", lambda: self._set_tool("pan")), ("C", lambda: self._set_tool("crop")),
-                           ("W", lambda: self._set_tool("pick")), ("R", lambda: self._orient("cw")),
-                           ("Shift+R", lambda: self._orient("ccw")), ("F", lambda: self.view.fit()),
-                           ("1", lambda: self.view.actual_size()), ("+", lambda: self.view.zoom_step(+1)),
-                           ("=", lambda: self.view.zoom_step(+1)), ("-", lambda: self.view.zoom_step(-1)),
-                           ("J", lambda: self.viewer.btn_clip.toggle())):
-            shortcut = QShortcut(QKeySequence(keys), self)
-            shortcut.activated.connect(slot)
+        self._restore_geometry()
+        self._layout(animate=False)
 
     # ------------------------------------------------------------ settings
+    def _load_json(self, key, default):
+        try:
+            value = json.loads(self.settings.value(key, "") or "null")
+        except Exception:
+            value = None
+        out = dict(default) if isinstance(default, dict) else default
+        if isinstance(default, dict) and isinstance(value, dict):
+            for k, v in value.items():
+                if k in default and isinstance(v, type(default[k])):
+                    out[k] = v
+        return out
+
+    def _load_appearance(self):
+        stored = self._load_json("appearance_v21", APPEARANCE_DEFAULTS)
+        if not QColor(stored.get("accent", "")).isValid():
+            stored["accent"] = APPEARANCE_DEFAULTS["accent"]
+        for key, lo, hi in (("panel_tint", 0, 90), ("bar_tint", 0, 90), ("card_shade", 0, 90), ("blur", 0, 24),
+                            ("refraction", 0, 100)):
+            stored[key] = int(min(max(int(stored[key]), lo), hi))
+        APPEARANCE.update(stored)
+        APPEARANCE_VERSION[0] += 1
+
+    def _save_appearance(self):
+        self.settings.setValue("appearance_v21", json.dumps(APPEARANCE))
+
+    def _load_user_defaults(self):
+        try:
+            return clean_defaults(json.loads(self.settings.value("develop_defaults_v21", "") or "{}"))
+        except Exception:
+            return {}
+
+    def _defaults(self):
+        d = dict(BUILTIN_DEFAULTS)
+        d.update(self.user_defaults)
+        return d
+
+    def _new_edit(self):
+        return edit_from_defaults(self._defaults())
+
     def _load_export_options(self):
         opts = ExportOptions()
         try:
@@ -7302,6 +9895,1119 @@ class MainWindow(QWidget):
     def _last_dir(self):
         return str(self.settings.value("last_dir", "") or "")
 
+    def _restore_geometry(self):
+        geo = self.settings.value("window_geometry_v21")
+        if geo:
+            try:
+                self.restoreGeometry(geo)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ construction
+    def _build_ui(self):
+        self.canvas = Canvas(self)
+        self.view = self.canvas
+        self.canvas.shadow_targets = self._shadow_targets
+        self.empty = EmptyState(self)
+        self.topbar = self._build_topbar()
+        self.lib_panel = self._build_library()
+        self.dev_panel = self._build_inspector()
+        self.strip = self._build_strip()
+        self.hud = ScopeHud(self)
+        self.hud._place = self._hud_pos
+        self.hud.opts.update(self._load_json("scope_v21", SCOPE_DEFAULTS))
+        if self.hud.opts["type"] not in SCOPE_TYPES:
+            self.hud.opts["type"] = "Histogram"
+        self.hud.opts["bins"] = int(self.hud.opts["bins"]) if int(self.hud.opts["bins"]) in (64, 128, 256) else 256
+        self.hud.opts["size"] = int(min(max(int(self.hud.opts["size"]), 70), 170))
+        self.hud.opts["gain"] = int(min(max(int(self.hud.opts["gain"]), 20), 100))
+        self.hud._resize_to_fit()
+        self.toast = Toast(self)
+        self.toast.on_place = self._place_toast
+        self.panel_reveal = Reveal(self)
+        self.strip_reveal = Reveal(self)
+        self.hud_reveal = Reveal(self)
+        self._build_popovers()
+        E, C = Qt.Edge, Qt.CursorShape
+        self.grips = [Grip(self, E.LeftEdge, C.SizeHorCursor), Grip(self, E.RightEdge, C.SizeHorCursor),
+                      Grip(self, E.TopEdge, C.SizeVerCursor), Grip(self, E.BottomEdge, C.SizeVerCursor),
+                      Grip(self, E.TopEdge | E.LeftEdge, C.SizeFDiagCursor),
+                      Grip(self, E.BottomEdge | E.RightEdge, C.SizeFDiagCursor),
+                      Grip(self, E.TopEdge | E.RightEdge, C.SizeBDiagCursor),
+                      Grip(self, E.BottomEdge | E.LeftEdge, C.SizeBDiagCursor)]
+        self.lib_panel.setVisible(self.lib_open)
+        self.dev_panel.setVisible(self.dev_open)
+        self.hud.hide()                  # it appears with the first picture
+
+    def _group(self, parent, margins=(4, 4, 4, 4), spacing=2):
+        g = GlassPanel("grp", parent)
+        h = QHBoxLayout(g)
+        h.setContentsMargins(*margins)
+        h.setSpacing(spacing)
+        g.setFixedHeight(38)
+        return g, h
+
+    def _build_topbar(self):
+        bar = TitleBar(self)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 6, 6, 0)
+        lay.setSpacing(6)
+        self._bar_layout = lay
+        tb = lambda text="", icon=None, tip="", check=False: GlassButton(text, icon, "tb", tip, check)  # noqa: E731
+
+        g, h = self._group(bar)
+        self.btn_lib = tb("", "sidebar_l", "Library (Tab)", True)
+        self.btn_app = GlassButton("F828 Converter", None, "app", "Appearance and about")
+        h.addWidget(self.btn_lib)
+        h.addWidget(self.btn_app)
+        lay.addWidget(g)
+        self.grp_app = g
+
+        g, h = self._group(bar, (12, 0, 12, 0), 10)
+        self.lbl_file = SLabel("No image", "hudb", wrap=False)
+        self.lbl_dims = SLabel("", "dim", wrap=False)
+        self.lbl_flag = SLabel("", "accent", wrap=False)
+        h.addWidget(self.lbl_file)
+        h.addWidget(self.lbl_dims)
+        h.addWidget(self.lbl_flag)
+        lay.addWidget(g)
+        self.grp_file = g
+
+        g, h = self._group(bar)
+        self.btn_zoom_out = tb("−", None, "Zoom out  (−)")
+        self.sl_zoom = MicroSlider(1000, "zoom")
+        self.sl_zoom.setFixedWidth(60)
+        self.sl_zoom.setToolTip("Zoom (double-click: fit)")
+        self.btn_zoom_in = tb("+", None, "Zoom in  (+)")
+        self.lbl_zoom = SLabel("–", "hud", wrap=False)
+        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_zoom.setFixedWidth(42)
+        self.btn_fit = tb("Fit", None, "Fit the picture in the window  (F)", True)
+        self.btn_100 = tb("1:1", None, "One screen pixel per image pixel  (1)", True)
+        self.btn_quality = tb("", "quality", "Preview quality", True)
+        for w in (self.btn_zoom_out, self.sl_zoom, self.btn_zoom_in, self.lbl_zoom, self.btn_fit, self.btn_100):
+            h.addWidget(w)
+        h.addWidget(GSep())
+        h.addWidget(self.btn_quality)
+        lay.addWidget(g)
+        self.grp_zoom = g
+        lay.addStretch(1)
+
+        g, h = self._group(bar)
+        self.btn_pan = tb("", "move", "Move: drag to move around the picture, scroll to zoom  (V)", True)
+        self.btn_crop = tb("", "crop", "Crop: drag the frame; switch tool to apply  (C)", True)
+        self.btn_pick = tb("", "pick", "Pick white: click something that should be neutral grey  (W)", True)
+        self.btn_undo = tb("", "undo", "Undo  (Ctrl+Z)")
+        self.btn_redo = tb("", "redo", "Redo  (Ctrl+Shift+Z)")
+        for w in (self.btn_pan, self.btn_crop, self.btn_pick):
+            h.addWidget(w)
+        h.addWidget(GSep())
+        h.addWidget(self.btn_undo)
+        h.addWidget(self.btn_redo)
+        lay.addWidget(g)
+        self.grp_tools = g
+
+        g, h = self._group(bar)
+        self.btn_before = tb("Before", "before", "See the picture without your edits  (\\)", True)
+        self.btn_clip = tb("Clipping", "clipping", "Paint blown highlights red and crushed blacks blue  (J)", True)
+        self.btn_proof = tb("Export preview", "eye", "Show the picture exactly as the export file will look", True)
+        self.btn_proof_menu = tb("", "chev_d", "Export preview options", True)
+        self.btn_proof_menu.icon_size = 10
+        self.btn_proof_menu.setFixedWidth(22)
+        h.addWidget(self.btn_before)
+        h.addWidget(self.btn_clip)
+        h.addWidget(GSep())
+        h.addWidget(self.btn_proof)
+        h.addWidget(self.btn_proof_menu)
+        lay.addWidget(g)
+        self.grp_view = g
+        lay.addStretch(1)
+
+        g, h = self._group(bar)
+        self.btn_scope = tb("", "scope", "Scope  (H)", True)
+        self.btn_dev = tb("", "sidebar_r", "Develop panel  (Shift+Tab)", True)
+        h.addWidget(self.btn_scope)
+        h.addWidget(self.btn_dev)
+        lay.addWidget(g)
+        self.grp_panels = g
+
+        self.btn_min = GlassButton("", "min", "cap", "Minimise", parent=self)
+        self.btn_max = GlassButton("", "max", "cap", "Maximise", parent=self)
+        self.btn_close = GlassButton("", "close", "capx", "Close", parent=self)
+        for b in (self.btn_min, self.btn_max, self.btn_close):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setVisible(self.frameless)
+        return bar
+
+    def _build_library(self):
+        panel = GlassPanel("panel", self)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(7, 7, 7, 1)
+        lay.setSpacing(0)
+
+        card, cl = make_card(spacing=7, margins=(8, 10, 8, 8))
+        head = QHBoxLayout()
+        head.setContentsMargins(4, 0, 4, 0)
+        head.setSpacing(8)
+        head.addWidget(SLabel("Library", "title", wrap=False))
+        self.lbl_count = SLabel("", "muted", wrap=False)
+        head.addWidget(self.lbl_count, 1)
+        cl.addLayout(head)
+        self.btn_add_files = GlassButton("Add files…", None, "btn", "Ctrl+O")
+        self.btn_add_folder = GlassButton("Add folder…", None, "btn", "Ctrl+Shift+O")
+        cl.addLayout(hrow(self.btn_add_files, self.btn_add_folder, stretch={0: 1, 1: 1}))
+        self.sw_subfolders = SwitchRow("Include subfolders", False, style="muted")
+        self.sw_subfolders.setMinimumHeight(22)
+        self.sw_subfolders.layout().setContentsMargins(4, 0, 0, 0)
+        cl.addWidget(self.sw_subfolders)
+        self.edit_filter = QLineEdit()
+        self.edit_filter.setPlaceholderText("Filter by name")
+        self.edit_filter.setClearButtonEnabled(True)
+        self.edit_filter.setFixedHeight(28)
+        cl.addWidget(self.edit_filter)
+        lay.addWidget(card)
+
+        card, cl = make_card(spacing=0, margins=(6, 6, 2, 6))
+        self.list = QListWidget()
+        self.list.setItemDelegate(LibraryDelegate(self.list))
+        self.list.setIconSize(QSize(56, 42))
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setMouseTracking(True)
+        self.list.viewport().setAutoFillBackground(False)
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+        cl.addWidget(self.list, 1)
+        self.lbl_empty_lib = SLabel("Nothing here yet. Add files or a folder, or drop them anywhere in the "
+                                    "window.", "note")
+        self.lbl_empty_lib.setContentsMargins(8, 8, 8, 8)
+        cl.addWidget(self.lbl_empty_lib)
+        lay.addWidget(card, 1)
+
+        card, cl = make_card(spacing=6, margins=(6, 6, 6, 6))
+        self.batch_row = QWidget()
+        br = QHBoxLayout(self.batch_row)
+        br.setContentsMargins(6, 0, 0, 0)
+        br.setSpacing(6)
+        self.lbl_ticked = SLabel("", "text", wrap=False)
+        self.lbl_ticked.setFont(ui_font(12.0, 600))
+        self.btn_sync = GlassButton("Sync edits…", None, "btn", "Copy this image's edits to the ticked images")
+        self.btn_export_checked = GlassButton("Export…", None, "btn", "Export the ticked images  (Ctrl+Shift+E)")
+        br.addWidget(self.lbl_ticked, 1)
+        br.addWidget(self.btn_sync)
+        br.addWidget(self.btn_export_checked)
+        cl.addWidget(self.batch_row)
+        self.btn_check_all = GlassButton("Tick all", None, "flat")
+        self.btn_check_none = GlassButton("Untick all", None, "flat")
+        self.btn_remove = GlassButton("Remove", None, "flat",
+                                      "Remove the highlighted images from this list (files are not deleted)")
+        cl.addLayout(hrow(self.btn_check_all, self.btn_check_none, self.btn_remove, spacing=4,
+                          stretch={0: 1, 1: 1, 2: 1}))
+        lay.addWidget(card)
+        return panel
+
+    def _build_inspector(self):
+        panel = GlassPanel("panel", self)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(7, 7, 7, 7)
+        outer.setSpacing(0)
+
+        head = Card()
+        head.setFixedHeight(38 + Card.SHADOW)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(12, 0, 6, Card.SHADOW)
+        hl.setSpacing(2)
+        hl.addWidget(SLabel("Develop", "title", wrap=False), 1)
+        self.btn_reset = GlassButton("Reset edits", None, "flat", "Back to the defaults for new images")
+        self.btn_defaults = GlassButton("", "more", "ib", "Defaults for new images", True)
+        hl.addWidget(self.btn_reset)
+        hl.addWidget(self.btn_defaults)
+        outer.addWidget(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self.cards = {}
+
+        def card(key, title, **kw):
+            c = FoldCard(title, key, open_=self.cards_open.get(key, False), **kw)
+            self.cards[key] = c
+            col.addWidget(c)
+            return c
+
+        # colour
+        c = card("colour", "Colour")
+        self.seg_colour = SegmentedControl(COLOUR_MODES, "real")
+        self.seg_colour.setToolTip(
+            "Sony Real / Standard: Sony's own rendering as Image Data Converter SR does it: the camera's "
+            "colour processor, set up from the registers stored in the .SRF (matrix, white balance, tone "
+            "curve and the per-shot colour coefficients). Use the mode the camera was set to.\n"
+            "Adobe-style: a plain colour matrix, sRGB curve and highlight roll-off (earlier versions' default).")
+        c.addWidget(self.seg_colour)
+        self.lbl_render = muted_label("")
+        self.lbl_render.hide_when_empty = True
+        self.lbl_render.hide()
+        c.addWidget(self.lbl_render)
+
+        # white balance
+        c = card("wb", "White Balance")
+        self.cmb_wb = combo_box([(key, label) for label, key, _tt in WB_PRESETS],
+                                "With Sony colour, Daylight, Cloudy, Shade, Tungsten, Fluorescent and Flash "
+                                "are Image Data Converter's own presets, exactly as it applies them.")
+        self.btn_auto_wb = GlassButton("Auto", None, "btn", "Estimate the light from the picture itself")
+        self.btn_pick_wb = GlassButton("Pick", None, "btn", "Click something that should be neutral grey  (W)", True)
+        r = hrow(self.cmb_wb, self.btn_auto_wb, self.btn_pick_wb, stretch={0: 1})
+        r.setContentsMargins(0, 1, 0, 3)
+        c.addLayout(r)
+        mired_lo, mired_hi = 1e6 / TEMP_MAX, 1e6 / TEMP_MIN
+        self.sl_temp = ParamSlider(
+            "Temperature", TEMP_MIN, TEMP_MAX, D65_TEMP_TINT[0], step=10.0, suffix=" K", style="temp",
+            positions=900,
+            to_value=lambda f: 1e6 / (mired_hi - (mired_hi - mired_lo) * f),
+            to_frac=lambda v: (mired_hi - 1e6 / v) / (mired_hi - mired_lo),
+            tip="Colour temperature of the light, in Kelvin. Left = cooler picture, right = warmer.")
+        c.addWidget(self.sl_temp)
+        self.sl_tint = ParamSlider("Tint", TINT_MIN, TINT_MAX, D65_TEMP_TINT[1], step=1.0, style="tint",
+                                   tip="Left = greener picture, right = more magenta.")
+        c.addWidget(self.sl_tint)
+        self.lbl_asshot = muted_label("")
+        self.lbl_asshot.hide_when_empty = True
+        self.lbl_asshot.hide()
+        c.addWidget(self.lbl_asshot)
+
+        # light
+        c = card("light", "Light")
+        self.sl_exp = ParamSlider("Exposure", -5.0, 5.0, 0.0, step=0.1, decimals=1, suffix=" EV", style="centered")
+        c.addWidget(self.sl_exp)
+        self.sl_black = ParamSlider("Black point", 0, 500, 0, step=1.0,
+                                    tip="Neutral black point (equal in R, G and B).")
+        c.addWidget(self.sl_black)
+        self.sw_rolloff = SwitchRow("Highlight soft roll-off", False,
+                                    "Eases the brightest tones into white instead of clipping them. The Sony "
+                                    "colour modes have their own highlight shoulder, so it is only used with "
+                                    "Adobe-style colour.")
+        c.addWidget(self.sw_rolloff)
+        self.sw_highlights = SwitchRow(
+            "Highlight reconstruction", False,
+            "Rebuilds channels that hit the sensor's limit from the ones that did not, instead of "
+            "cutting everything at white. Gives the roll-off (or a lower exposure) real detail to "
+            "bring back. Fully blown areas stay white.")
+        c.addWidget(self.sw_highlights)
+        self.sw_ir = SwitchRow("IR false colour (Aerochrome)", False)
+        c.addWidget(self.sw_ir)
+
+        # crop
+        c = card("crop", "Crop and Straighten")
+        self.btn_ccw = GlassButton("", "rot_l", "btn", "Rotate 90° left  (Shift+R)")
+        self.btn_cw = GlassButton("", "rot_r", "btn", "Rotate 90° right  (R)")
+        self.btn_fliph = GlassButton("", "flip_h", "btn", "Mirror left-right")
+        self.btn_flipv = GlassButton("", "flip_v", "btn", "Flip top-bottom")
+        for b in (self.btn_ccw, self.btn_cw, self.btn_fliph, self.btn_flipv):
+            b.setMinimumWidth(40)
+        r = hrow(self.btn_ccw, self.btn_cw, self.btn_fliph, self.btn_flipv, stretch={0: 1, 1: 1, 2: 1, 3: 1})
+        r.setContentsMargins(0, 1, 0, 3)
+        c.addLayout(r)
+        self.cmb_aspect = combo_box([(value, label) for label, value in ASPECTS])
+        w = QWidget()
+        w.setLayout(labelled_row("Shape", self.cmb_aspect))
+        w.layout().setContentsMargins(0, 0, 0, 0)
+        w.setMinimumHeight(30)
+        c.addWidget(w)
+        self.sl_straighten = ParamSlider("Straighten", -20.0, 20.0, 0.0, step=0.1, decimals=1,
+                                         suffix="°", style="centered",
+                                         tip="Positive turns the picture clockwise. The crop shrinks "
+                                             "automatically so no empty corners show.")
+        c.addWidget(self.sl_straighten)
+        self.btn_crop_tool = GlassButton("Edit crop", None, "btn", "Drag the frame on the picture  (C)", True)
+        self.btn_reset_crop = GlassButton("Reset crop", None, "btn")
+        r = hrow(self.btn_crop_tool, self.btn_reset_crop, stretch={0: 1})
+        r.setContentsMargins(0, 3, 0, 1)
+        c.addLayout(r)
+        self.lbl_crop = muted_label("")
+        self.lbl_crop.hide_when_empty = True
+        self.lbl_crop.hide()
+        c.addWidget(self.lbl_crop)
+
+        # lens
+        c = card("lens", "Lens Corrections")
+        lab = SLabel("Chromatic aberration", "text", wrap=False)
+        self.btn_auto_ca = GlassButton("Auto", None, "btn",
+                                       "Measure the colour fringing from the picture itself and correct it")
+        r = hrow(lab, self.btn_auto_ca, stretch={0: 1})
+        r.setContentsMargins(0, 1, 0, 3)
+        c.addLayout(r)
+        self.sl_ca_red = ParamSlider(
+            "Red / cyan", -60.0, 60.0, 0.0, step=0.5, decimals=1, style="centered",
+            tip="Scales the red image against the green one, in 1/10000 of the frame. Removes red / cyan "
+                "fringes that grow towards the corners.")
+        c.addWidget(self.sl_ca_red)
+        self.sl_ca_blue = ParamSlider(
+            "Blue / yellow", -60.0, 60.0, 0.0, step=0.5, decimals=1, style="centered",
+            tip="Scales the blue (and partly the emerald) image against the green one. Removes blue / "
+                "yellow fringes that grow towards the corners.")
+        c.addWidget(self.sl_ca_blue)
+        self.lbl_ca = muted_label("")
+        self.lbl_ca.hide_when_empty = True
+        self.lbl_ca.hide()
+        c.addWidget(self.lbl_ca)
+        self.sl_defringe = ParamSlider(
+            "Defringe", 0, 100, 0,
+            tip="Removes the purple (and green) fringes along high-contrast edges, such as branches or "
+                "window frames against a bright sky. Blue sky and purple objects away from such edges "
+                "are left alone.")
+        c.addWidget(self.sl_defringe)
+
+        # noise
+        c = card("noise", "Noise Reduction")
+        self.sl_chroma_nr = ParamSlider(
+            "Colour noise", 0, 100, 0,
+            tip="Smooths the coloured speckles and blotches of noise, guided by the picture's own edges so "
+                "colours do not bleed. Brightness detail is left alone.")
+        c.addWidget(self.sl_chroma_nr)
+
+        # sensor
+        c = card("sensor", "Sensor (Advanced)")
+        self.cmb_demosaic = combo_box([(key, text.replace("  ", " ")) for text, key in DEMOSAIC_MODES
+                                       if key != "idc" or idc_demosaic_available()])
+        self.cmb_demosaic.setToolTip(
+            "How the full-colour picture is rebuilt from the sensor's RGBE mosaic.\n"
+            "Edge-aware: follows edges in every colour. A little more fine detail than IDC, but more "
+            "colour noise and some colour fringing on fine lines.\n"
+            "IDC: Sony Image Data Converter's own method, recreated. Smooth colour planes "
+            "with a sharp brightness taken from the green and emerald photosites, and colour removed "
+            "on the very hardest edges. With Sony colour it reproduces IDC's own files "
+            "to within 1/255. Least colour noise and no colour fringes on fine lines.\n"
+            "Bilinear: v15's. The softest.")
+        w = QWidget()
+        w.setLayout(labelled_row("Demosaic", self.cmb_demosaic))
+        w.layout().setContentsMargins(0, 0, 0, 0)
+        w.setMinimumHeight(30)
+        c.addWidget(w)
+        self.lbl_demosaic = muted_label("")
+        c.addWidget(self.lbl_demosaic)
+        self.sw_hot = SwitchRow(
+            "Remove hot pixels", False,
+            "Replaces stuck bright (or dead dark) photosites with their neighbours before the demosaic. "
+            "Real points of light such as stars or glints are kept: they spread over photosites of "
+            "every colour, a hot pixel does not.")
+        c.addWidget(self.sw_hot)
+        self.lbl_hot = muted_label("")
+        c.addWidget(self.lbl_hot)
+        self.cmb_black = combo_box([(key, text) for text, key in BLACK_MODES])
+        w = QWidget()
+        w.setLayout(labelled_row("Black level", self.cmb_black))
+        w.layout().setContentsMargins(0, 0, 0, 0)
+        w.setMinimumHeight(30)
+        c.addWidget(w)
+        self.sw_black_table = SwitchRow("Show the measured levels", False)
+        c.addWidget(self.sw_black_table)
+        self.lbl_black_info = muted_label("", mono=True)
+        self.lbl_black_info.setVisible(False)
+        c.addWidget(self.lbl_black_info)
+        self._update_demosaic_note()
+
+        # info
+        c = card("info", "Image Info", switchable=False, resettable=False)
+        self.lbl_info = muted_label("No image loaded")
+        self.lbl_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        c.addWidget(self.lbl_info)
+
+        col.addStretch(1)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        self.dev_scroll = scroll
+
+        self.btn_export = GlassButton("Export this image…", None, "pri", "Ctrl+E")
+        foot = QVBoxLayout()
+        foot.setContentsMargins(0, 6, 0, 0)
+        foot.addWidget(self.btn_export)
+        outer.addLayout(foot)
+        return panel
+
+    def _build_strip(self):
+        strip = GlassPanel("strip", self)
+        lay = QHBoxLayout(strip)
+        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setSpacing(9)
+        self.btn_strip_add = GlassButton("+", None, "tb", "Add files…  (Ctrl+O)")
+        lay.addWidget(self.btn_strip_add)
+        self.rail = ThumbRail()
+        lay.addWidget(self.rail, 1)
+        self.strip_batch = QWidget()
+        sb = QHBoxLayout(self.strip_batch)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(4)
+        sb.addWidget(GSep())
+        self.lbl_strip_ticked = SLabel("", "dim", wrap=False)
+        sb.addWidget(self.lbl_strip_ticked)
+        self.btn_strip_sync = GlassButton("Sync…", None, "tb", "Copy this image's edits to the ticked images")
+        self.btn_strip_export = GlassButton("Export…", None, "tb", "Export the ticked images")
+        sb.addWidget(self.btn_strip_sync)
+        sb.addWidget(self.btn_strip_export)
+        lay.addWidget(self.strip_batch)
+        strip.setFixedHeight(self.STRIP_H)
+        strip.hide()
+        return strip
+
+    def _build_popovers(self):
+        # preview quality
+        pop = Popover(self, 304, "Preview quality")
+        self.seg_res = SegmentedControl([("25%", "quarter"), ("50%", "half"), ("100%", "full")], self.preview_level)
+        pop.lay.addLayout(labelled_row("Resolution", self.seg_res))
+        self.sw_draft = SwitchRow("Draft while adjusting", self.draft_on,
+                                  "Show a fast 25% draft while a slider moves, then sharpen")
+        pop.lay.addWidget(self.sw_draft)
+        self.lbl_res = muted_label("")
+        pop.lay.addWidget(self.lbl_res)
+        self.btn_full = GlassButton("Full quality now", None, "btn",
+                                    "100% resolution, no draft step: every pixel exactly as a full-size "
+                                    "lossless export holds it")
+        pop.lay.addWidget(self.btn_full)
+        self.pop_quality = pop
+
+        # export preview
+        pop = Popover(self, 304, "Export preview")
+        self.cmb_proof_fmt = combo_box([], "The export's file type (the same setting as in Export settings)")
+        pop.lay.addLayout(labelled_row("Format", self.cmb_proof_fmt))
+        self.sl_proof_q = ParamSlider("Quality", 1, 100, 92, tip="The export's quality setting")
+        pop.lay.addWidget(self.sl_proof_q)
+        self.cmb_proof_view = combo_box([(key, label) for key, label in PROOF_VIEWS],
+                                        "'What the compression changed' shows the difference between the "
+                                        "compressed file and the same pixels uncompressed, 8 times brighter")
+        pop.lay.addLayout(labelled_row("Show", self.cmb_proof_view))
+        self.lbl_proof_opts = muted_label("")
+        pop.lay.addWidget(self.lbl_proof_opts)
+        self.lbl_proof = muted_label("")
+        pop.lay.addWidget(self.lbl_proof)
+        self.btn_export_settings = GlassButton("Export settings…", None, "btn",
+                                               "Every export setting: size, sharpening, colour space, bit "
+                                               "depth, compression, metadata, destination")
+        pop.lay.addWidget(self.btn_export_settings)
+        self.pop_proof = pop
+
+        # defaults
+        pop = Popover(self, 292, "Defaults for new images")
+        self.lbl_def_summary = muted_label("")
+        pop.lay.addWidget(self.lbl_def_summary)
+        self.btn_save_defaults = GlassButton("Save current settings as defaults", None, "btn")
+        self.btn_builtin_defaults = GlassButton("Restore built-in defaults", None, "flat")
+        pop.lay.addWidget(self.btn_save_defaults)
+        pop.lay.addWidget(self.btn_builtin_defaults)
+        pop.lay.addWidget(muted_label("Reset edits returns an image to these. Crop and straighten are never "
+                                      "saved as defaults."))
+        self.pop_defaults = pop
+
+        # scope options
+        pop = Popover(self, 286, "Scope options")
+        o = self.hud.opts if hasattr(self, "hud") else SCOPE_DEFAULTS
+        self.sl_scope_size = ParamSlider("Size", 70, 170, 100, step=5, suffix="%")
+        pop.lay.addWidget(self.sl_scope_size)
+        self.scope_hist_rows = QWidget()
+        hl = QVBoxLayout(self.scope_hist_rows)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+        self.seg_scope_ch = SegmentedControl([("RGB", "RGB"), ("Luma", "Luma"), ("Both", "Both")], "RGB")
+        hl.addLayout(labelled_row("Channels", self.seg_scope_ch))
+        self.seg_scope_scale = SegmentedControl([("Linear", "Linear"), ("Log", "Log")], "Linear")
+        hl.addLayout(labelled_row("Scale", self.seg_scope_scale))
+        self.seg_scope_bins = SegmentedControl([("256", 256), ("128", 128), ("64", 64)], 256)
+        hl.addLayout(labelled_row("Resolution", self.seg_scope_bins))
+        self.sw_scope_clip = SwitchRow("Clipping markers", True,
+                                       "Small squares that light up when any pixel is pure black (blue) or "
+                                       "clipped (red)")
+        hl.addWidget(self.sw_scope_clip)
+        pop.lay.addWidget(self.scope_hist_rows)
+        self.scope_other_rows = QWidget()
+        ol = QVBoxLayout(self.scope_other_rows)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(6)
+        self.sl_scope_gain = ParamSlider("Brightness", 20, 100, 85, step=5, suffix="%")
+        ol.addWidget(self.sl_scope_gain)
+        self.sw_scope_grat = SwitchRow("Graticule", True)
+        ol.addWidget(self.sw_scope_grat)
+        pop.lay.addWidget(self.scope_other_rows)
+        cap = SLabel("Advanced", "muted", wrap=False)
+        cap.setFont(ui_font(12.0, 600))
+        cap.setContentsMargins(0, 8, 0, 2)
+        pop.lay.addWidget(cap)
+        self.cmb_scope_type = combo_box([(t, t) for t in SCOPE_TYPES])
+        pop.lay.addLayout(labelled_row("Scope", self.cmb_scope_type))
+        self.btn_scope_hide = GlassButton("Hide", None, "flat", "Hide the scope  (H)")
+        self.btn_scope_reset = GlassButton("Reset options", None, "flat", "Back to the standard histogram")
+        pop.lay.addLayout(hrow(self.btn_scope_hide, self.btn_scope_reset, stretch={0: 1, 1: 1}))
+        self.pop_scope = pop
+        del o
+
+        # appearance
+        pop = Popover(self, 312, "Appearance")
+        sw = QHBoxLayout()
+        sw.setSpacing(8)
+        sw.addWidget(SLabel("Accent", "text", wrap=False), 0)
+        sw.addSpacing(54)
+        self.accent_buttons = []
+        for colour in ACCENT_CHOICES:
+            b = AccentSwatch(colour)
+            b.clicked.connect(lambda _c=False, colour=colour: self._set_appearance(accent=colour))
+            sw.addWidget(b)
+            self.accent_buttons.append(b)
+        sw.addStretch(1)
+        pop.lay.addLayout(sw)
+        self.app_sliders = {}
+        for key, label, hi, suffix in (("panel_tint", "Panel glass", 90, "%"), ("bar_tint", "Toolbar glass", 90, "%"),
+                                       ("card_shade", "Card shade", 90, "%"), ("blur", "Blur", 24, " px"),
+                                       ("refraction", "Edge refraction", 100, "%")):
+            s = ParamSlider(label, 0, hi, APPEARANCE_DEFAULTS[key], step=5 if key == "refraction" else 1,
+                            suffix=suffix, label_width=104)
+            s.set_value(APPEARANCE[key])
+            s.changed.connect(lambda v, key=key: self._set_appearance(**{key: int(round(v))}))
+            pop.lay.addWidget(s)
+            self.app_sliders[key] = s
+        self.app_switches = {}
+        for key, label, tip in (("ambient", "Ambient light", "The picture's colours glow softly around it"),
+                                ("filmstrip", "Filmstrip", "Thumbnails along the bottom while the library is hidden"),
+                                ("motion", "Motion", "Spring animations (also off when Windows' animation "
+                                                     "effects are off)"),
+                                ("native_frame", "Standard title bar", "Use the normal Windows title bar instead "
+                                                                       "of the built-in one (applies at once)")):
+            s = SwitchRow(label, bool(APPEARANCE[key]), tip)
+            s.toggled.connect(lambda on, key=key: self._set_appearance(**{key: bool(on)}))
+            pop.lay.addWidget(s)
+            self.app_switches[key] = s
+        self.btn_app_reset = GlassButton("Reset appearance", None, "flat")
+        pop.lay.addWidget(self.btn_app_reset)
+        about = muted_label(f"F828 Converter v{APP_VERSION}  ·  github.com/wuvshroom\n"
+                            "PolyForm Noncommercial 1.0.0")
+        pop.lay.addWidget(about)
+        self.pop_appearance = pop
+
+    # ------------------------------------------------------------ wiring
+    def _connect(self):
+        c = self.canvas
+        self.btn_add_files.clicked.connect(self._add_files)
+        self.btn_add_folder.clicked.connect(self._add_folder)
+        self.empty.btn_files.clicked.connect(self._add_files)
+        self.empty.btn_folder.clicked.connect(self._add_folder)
+        self.btn_strip_add.clicked.connect(self._add_files)
+        self.edit_filter.textChanged.connect(self._apply_filter)
+        self.list.currentItemChanged.connect(self._current_item_changed)
+        self.list.itemChanged.connect(self._update_counts)
+        self.btn_check_all.clicked.connect(lambda *_: self._tick_all(True))
+        self.btn_check_none.clicked.connect(lambda *_: self._tick_all(False))
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.rail.openRequested.connect(self._open_from_strip)
+
+        self.btn_reset.clicked.connect(self._reset_edits)
+        self.btn_defaults.clicked.connect(self._open_defaults_menu)
+        self.btn_save_defaults.clicked.connect(self._save_defaults)
+        self.btn_builtin_defaults.clicked.connect(self._restore_builtin_defaults)
+        self.seg_colour.changed.connect(self._render_changed)
+        self.cmb_wb.currentIndexChanged.connect(self._wb_preset_changed)
+        self.btn_auto_wb.clicked.connect(lambda *_: self._apply_wb_preset("auto"))
+        self.btn_pick_wb.clicked.connect(lambda *_: self._set_tool("pick" if self.btn_pick_wb.isChecked() else "pan"))
+        self.sl_temp.changed.connect(self._temp_tint_changed)
+        self.sl_tint.changed.connect(self._temp_tint_changed)
+        self.sl_exp.changed.connect(self._tone_changed)
+        self.sl_black.changed.connect(self._tone_changed)
+        self.sw_rolloff.toggled.connect(self._tone_changed)
+        self.sw_highlights.toggled.connect(self._tone_changed)
+        self.sw_ir.toggled.connect(self._tone_changed)
+        self.cmb_demosaic.currentIndexChanged.connect(self._demosaic_changed)
+        self.sw_hot.toggled.connect(self._hot_changed)
+        self.sl_ca_red.changed.connect(self._lens_changed)
+        self.sl_ca_blue.changed.connect(self._lens_changed)
+        self.btn_auto_ca.clicked.connect(self._auto_ca)
+        self.sl_defringe.changed.connect(self._detail_changed)
+        self.sl_chroma_nr.changed.connect(self._detail_changed)
+        self.cmb_black.currentIndexChanged.connect(self._black_mode_changed)
+        self.sw_black_table.toggled.connect(lambda on: self.lbl_black_info.setVisible(on))
+        self.cmb_aspect.currentIndexChanged.connect(self._aspect_changed)
+        self.sl_straighten.changed.connect(self._straighten_changed)
+        self.btn_crop_tool.clicked.connect(lambda *_: self._set_tool("crop" if self.btn_crop_tool.isChecked() else "pan"))
+        self.btn_reset_crop.clicked.connect(self._reset_crop)
+        self.btn_cw.clicked.connect(lambda *_: self._orient("cw"))
+        self.btn_ccw.clicked.connect(lambda *_: self._orient("ccw"))
+        self.btn_fliph.clicked.connect(lambda *_: self._orient("fliph"))
+        self.btn_flipv.clicked.connect(lambda *_: self._orient("flipv"))
+        for key, card in self.cards.items():
+            card.reset_clicked.connect(lambda key=key: self._reset_section(key))
+            card.enabled_changed.connect(lambda on, key=key: self._section_switched(key, on))
+            card.toggled_open.connect(lambda on, key=key: self._card_folded(key, on))
+
+        self.btn_pan.clicked.connect(lambda *_: self._set_tool("pan"))
+        self.btn_crop.clicked.connect(lambda *_: self._set_tool("crop"))
+        self.btn_pick.clicked.connect(lambda *_: self._set_tool("pick"))
+        self.btn_undo.clicked.connect(self._undo)
+        self.btn_redo.clicked.connect(self._redo)
+        self.btn_zoom_in.clicked.connect(lambda *_: c.zoom_step(+1))
+        self.btn_zoom_out.clicked.connect(lambda *_: c.zoom_step(-1))
+        self.btn_fit.clicked.connect(lambda *_: c.fit())
+        self.btn_100.clicked.connect(lambda *_: c.actual_size())
+        self.sl_zoom.valueChanged.connect(self._zoom_slider_moved)
+        self.btn_clip.toggled.connect(self._request)
+        self.btn_before.toggled.connect(self._before_toggled)
+        self.btn_proof.toggled.connect(self._proof_toggled)
+        self.btn_proof_menu.clicked.connect(self._open_proof_menu)
+        self.btn_quality.clicked.connect(self._open_quality_menu)
+        self.btn_lib.clicked.connect(lambda *_: self._set_lib_open(self.btn_lib.isChecked()))
+        self.btn_dev.clicked.connect(lambda *_: self._set_dev_open(self.btn_dev.isChecked()))
+        self.btn_scope.clicked.connect(lambda *_: self._set_scope_visible(self.btn_scope.isChecked()))
+        self.btn_app.clicked.connect(self._open_appearance_menu)
+        self.btn_min.clicked.connect(self.showMinimized)
+        self.btn_max.clicked.connect(self.toggle_maximized)
+        self.btn_close.clicked.connect(self.close)
+
+        self.seg_res.changed.connect(self._preview_level_changed)
+        self.sw_draft.toggled.connect(self._draft_toggled)
+        self.btn_full.clicked.connect(self._full_quality)
+        self.cmb_proof_fmt.currentIndexChanged.connect(self._proof_format_changed)
+        self.sl_proof_q.changed.connect(self._proof_quality_changed)
+        self.cmb_proof_view.currentIndexChanged.connect(lambda *_: self._request_proof())
+        self.btn_export_settings.clicked.connect(self._export_settings)
+        for pop, btn in ((self.pop_quality, self.btn_quality), (self.pop_proof, self.btn_proof_menu),
+                         (self.pop_defaults, self.btn_defaults)):
+            pop.closed.connect(lambda btn=btn: btn.setChecked(False))
+
+        self.hud.optionsRequested.connect(self._open_scope_menu)
+        self.hud.cornerChanged.connect(lambda *_: self._save_scope())
+        self.sl_scope_size.changed.connect(lambda v: self._scope_option(size=int(round(v))))
+        self.sl_scope_gain.changed.connect(lambda v: self._scope_option(gain=int(round(v))))
+        self.seg_scope_ch.changed.connect(lambda k: self._scope_option(channels=k))
+        self.seg_scope_scale.changed.connect(lambda k: self._scope_option(scale=k))
+        self.seg_scope_bins.changed.connect(lambda k: self._scope_option(bins=int(k)))
+        self.sw_scope_clip.toggled.connect(lambda on: self._scope_option(clip=bool(on)))
+        self.sw_scope_grat.toggled.connect(lambda on: self._scope_option(graticule=bool(on)))
+        self.cmb_scope_type.currentIndexChanged.connect(
+            lambda *_: self._scope_option(type=self.cmb_scope_type.currentData()))
+        self.btn_scope_hide.clicked.connect(lambda *_: (self.pop_scope.close_menu(), self._set_scope_visible(False)))
+        self.btn_scope_reset.clicked.connect(self._reset_scope)
+        self.btn_app_reset.clicked.connect(self._reset_appearance)
+
+        c.cropChanged.connect(self._crop_dragged)
+        c.cropFinished.connect(self._crop_finished)
+        c.pointPicked.connect(self._picked)
+        c.applyRequested.connect(lambda *_: self._set_tool("pan"))
+        c.zoomChanged.connect(self._zoom_changed)
+
+        self.seg_res.set_key(self.preview_level, animate=False)
+        self._sync_proof_controls()
+        self._update_res_note()
+
+        self.btn_sync.clicked.connect(self._sync)
+        self.btn_strip_sync.clicked.connect(self._sync)
+        self.btn_export.clicked.connect(lambda *_: self._export(False))
+        self.btn_export_checked.clicked.connect(lambda *_: self._export(True))
+        self.btn_strip_export.clicked.connect(lambda *_: self._export(True))
+
+        for keys, slot in (("Ctrl+O", self._add_files), ("Ctrl+Shift+O", self._add_folder),
+                           ("Ctrl+E", lambda: self._export(False)), ("Ctrl+Shift+E", lambda: self._export(True)),
+                           ("V", lambda: self._set_tool("pan")), ("C", lambda: self._set_tool("crop")),
+                           ("W", lambda: self._set_tool("pick")), ("R", lambda: self._orient("cw")),
+                           ("Shift+R", lambda: self._orient("ccw")), ("F", lambda: self.canvas.fit()),
+                           ("1", lambda: self.canvas.actual_size()), ("+", lambda: self.canvas.zoom_step(+1)),
+                           ("=", lambda: self.canvas.zoom_step(+1)), ("-", lambda: self.canvas.zoom_step(-1)),
+                           ("J", lambda: self.btn_clip.toggle()), ("\\", lambda: self.btn_before.toggle()),
+                           ("H", lambda: self._set_scope_visible(not self.hud.opts.get("visible", True))),
+                           ("Ctrl+Z", self._undo), ("Ctrl+Shift+Z", self._redo), ("Ctrl+Y", self._redo),
+                           ("Tab", lambda: self._tab_key(False)), ("Shift+Tab", lambda: self._tab_key(True))):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.activated.connect(slot)
+
+    def _tab_key(self, shift):
+        """Tab hides the library and Shift+Tab the Develop panel; inside an open
+        menu they move the keyboard focus as usual."""
+        if any(p.is_open() for p in self._popovers()):
+            self.focusNextPrevChild(not shift)
+        elif shift:
+            self._set_dev_open(not self.dev_open)
+        else:
+            self._set_lib_open(not self.lib_open)
+
+    def _popovers(self):
+        return [self.pop_quality, self.pop_proof, self.pop_defaults, self.pop_scope, self.pop_appearance]
+
+    # ------------------------------------------------------------ layout
+    def _column(self):
+        W = self.width()
+        left = self.GAP + (self.LIB_W + self.GAP if self.lib_open else 0)
+        right = W - self.GAP - (self.DEV_W + self.GAP if self.dev_open else 0)
+        return left, right
+
+    def _strip_on(self):
+        return (not self.lib_open) and bool(APPEARANCE.get("filmstrip", True)) and bool(self.entries)
+
+    def hud_area(self):
+        left, right = self._column()
+        bottom = self.height() - self.GAP - (self.STRIP_H + 14 if self._strip_on() else 0)
+        return QRectF(left, self.TOP, max(10, right - left), max(10, bottom - self.TOP))
+
+    def _hud_pos(self, corner):
+        area = self.hud_area()
+        bw, bh = self.hud.body_size()
+        x = area.left() if corner[1] == "l" else area.right() - bw
+        y = area.top() if corner[0] == "t" else area.bottom() - bh
+        return QPoint(int(round(x)) - ScopeHud.M, int(round(y)) - ScopeHud.M)
+
+    def _layout(self, animate=True):
+        W, H = self.width(), self.height()
+        self.canvas.setGeometry(0, 0, W, H)
+        cap_w = 3 * 46 if self.frameless else 0
+        self._bar_layout.setContentsMargins(6, 6, 6 + cap_w, 0)
+        self.topbar.setGeometry(0, 0, W, 44)
+        for i, b in enumerate((self.btn_min, self.btn_max, self.btn_close)):
+            b.setGeometry(W - cap_w + i * 46, 0, 46, 32)
+            b.raise_()
+        ph = H - self.TOP - self.GAP
+        self.lib_panel.setGeometry(self.GAP, self.TOP, self.LIB_W, ph)
+        self.dev_panel.setGeometry(W - self.GAP - self.DEV_W, self.TOP, self.DEV_W, ph)
+        left, right = self._column()
+        strip_on = self._strip_on()
+        if strip_on:
+            self._update_strip()
+            content = self.rail.content_width() + 12 + 26 + 9 + 9 + (self.strip_batch.sizeHint().width() + 9
+                                                                     if self.strip_batch.isVisible() else 0)
+            sw = int(min(right - left, content + 12))
+            self.strip.setGeometry(int(left + (right - left - sw) / 2), H - self.GAP - self.STRIP_H, sw, self.STRIP_H)
+            if not self.strip.isVisible() and not self.strip_reveal.busy_with(self.strip):
+                self.strip_reveal.play(self.strip, "b", (0.9, 0.8), (0.0, 40.0), fade=False, k=300.0, c=13.0)
+        else:
+            self.strip_reveal.finish()
+            self.strip.hide()
+        bottom = H - self.GAP - (self.STRIP_H + 14 if strip_on else 0)
+        free = QRectF(left, self.TOP, max(40, right - left), max(40, bottom - self.TOP))
+        self.canvas.set_free_rect(free, animate=animate)
+        self.empty.adjustSize()
+        self.empty.move(int(free.center().x() - self.empty.width() / 2),
+                        int(free.center().y() - self.empty.height() / 2))
+        self.empty.setVisible(not self.entries)
+        self.hud.move_to_corner(animate=animate)
+        self._place_toast()
+        g = 5
+        maximised = self.isMaximized() or self.isFullScreen()
+        for grip, rect in zip(self.grips, (QRect(0, g, g, H - 2 * g), QRect(W - g, g, g, H - 2 * g),
+                                           QRect(g, 0, W - 2 * g - cap_w, g), QRect(g, H - g, W - 2 * g, g),
+                                           QRect(0, 0, g, g), QRect(W - g, H - g, g, g),
+                                           QRect(W - g, 0, g, g), QRect(0, H - g, g, g))):
+            grip.setGeometry(rect)
+            grip.setVisible(self.frameless and not maximised)
+            grip.raise_()
+        # narrow windows: drop the button labels, then the app name and picture size
+        for b in (self.btn_before, self.btn_clip, self.btn_proof):
+            b.set_label_visible(W >= 1400)
+        self.btn_app.setVisible(W >= 1150)
+        self.lbl_dims.setVisible(W >= 1150 and bool(self.lbl_dims.text()))
+        self.btn_lib.setChecked(self.lib_open)
+        self.btn_dev.setChecked(self.dev_open)
+        self.btn_scope.setChecked(bool(self.hud.opts.get("visible", True)))
+        self.canvas.update()
+
+    def _place_toast(self):
+        if not hasattr(self, "toast"):
+            return
+        left, right = self._column()
+        self.toast.adjustSize()
+        w = min(self.toast.sizeHint().width(), int(right - left - 24))
+        self.toast.resize(max(120, w), self.toast.sizeHint().height())
+        bottom = self.height() - self.GAP - (self.STRIP_H + 14 if self._strip_on() else 0) - 14
+        x = int(left + (right - left - self.toast.width()) / 2)
+        y = int(bottom - self.toast.height())
+        if self.hud.isVisible() and self.hud.opts.get("corner", "tl")[0] == "b":
+            g = self.hud.glass_geometry()               # keep clear of a scope in a bottom corner
+            if QRectF(x, y, self.toast.width(), self.toast.height()).intersects(g.adjusted(-8, -8, 8, 8)):
+                y = int(g.top() - 10 - self.toast.height())
+        self.toast.move(x, y)
+
+    def _shadow_targets(self):
+        out = []
+        for g in (self.grp_app, self.grp_file, self.grp_zoom, self.grp_tools, self.grp_view, self.grp_panels):
+            if g.isVisible() and self.topbar.isVisible():
+                out.append((QRectF(g.geometry()).translated(QPointF(self.topbar.pos())), "grp", False))
+        for w, kind in ((self.lib_panel, "panel"), (self.dev_panel, "panel"), (self.strip, "strip"),
+                        (self.toast, "toast")):
+            if w.isVisible():
+                out.append((QRectF(w.geometry()), kind, False))
+        if self.hud.isVisible():
+            out.append((self.hud.glass_geometry(), "hud", self.hud._dragging))
+        return out
+
+    def layer_grab(self, rect):
+        """A still picture of the window under rect, without menus (the glass of a menu bends it)."""
+        dpr = max(1.0, self.devicePixelRatioF())
+        img = QImage(max(1, int(math.ceil(rect.width() * dpr))), max(1, int(math.ceil(rect.height() * dpr))),
+                     QImage.Format.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Canvas.BG)
+        p = QPainter(img)
+        for w in (self.canvas, self.empty, self.topbar, self.lib_panel, self.dev_panel, self.strip, self.hud,
+                  self.btn_min, self.btn_max, self.btn_close):
+            if not w.isVisible():
+                continue
+            g = w.geometry()
+            inter = g.intersected(rect)
+            if inter.isEmpty():
+                continue
+            w.render(p, QPoint(g.x() - rect.x(), g.y() - rect.y()), QRegion(inter.translated(-g.x(), -g.y())),
+                     QWidget.RenderFlag.DrawChildren)
+        p.end()
+        return img
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout(animate=False)
+        for pop in self._popovers():
+            pop.close_menu()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            maxed = self.isMaximized()
+            self.btn_max.set_icon("restore" if maxed else "max")
+            self.btn_max.setToolTip("Restore" if maxed else "Maximise")
+            self._layout(animate=False)
+
+    def toggle_maximized(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.frameless and sys.platform == "win32":
+            try:                                        # Windows 11: rounded window corners
+                import ctypes
+                pref = ctypes.c_int(2)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(self.winId()), 33, ctypes.byref(pref), 4)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ panels
+    def _set_lib_open(self, on):
+        on = bool(on)
+        self.btn_lib.setChecked(on)
+        if on == self.lib_open:
+            return
+        self.lib_open = on
+        self.settings.setValue("library_open", "true" if on else "false")
+        if on:
+            self.lib_panel.setGeometry(self.GAP, self.TOP, self.LIB_W, self.height() - self.TOP - self.GAP)
+            self.lib_panel.hide()
+            self.panel_reveal.play(self.lib_panel, "l", (0.9, 1.0), (-46.0, 0.0), fade=False, k=200.0, c=17.0)
+        else:
+            if self.panel_reveal.busy_with(self.lib_panel):
+                self.panel_reveal.finish()
+            self.lib_panel.hide()
+        self._layout()
+
+    def _set_dev_open(self, on):
+        on = bool(on)
+        self.btn_dev.setChecked(on)
+        if on == self.dev_open:
+            return
+        self.dev_open = on
+        self.settings.setValue("develop_open", "true" if on else "false")
+        if on:
+            self.dev_panel.setGeometry(self.width() - self.GAP - self.DEV_W, self.TOP, self.DEV_W,
+                                       self.height() - self.TOP - self.GAP)
+            self.dev_panel.hide()
+            self.panel_reveal.play(self.dev_panel, "r", (0.9, 1.0), (46.0, 0.0), fade=False, k=200.0, c=17.0)
+        else:
+            if self.panel_reveal.busy_with(self.dev_panel):
+                self.panel_reveal.finish()
+            self.dev_panel.hide()
+        self._layout()
+
+    def _set_scope_visible(self, on):
+        on = bool(on)
+        self.btn_scope.setChecked(on)
+        if self.hud.opts.get("visible", True) != on:
+            self.hud.opts["visible"] = on
+            self._save_scope()
+        on = on and self._shown is not None      # without a picture it waits for the next one
+        if on == (self.hud.isVisible() or self.hud_reveal.busy_with(self.hud)):
+            return
+        if on:
+            self.hud.set_image(self._shown)
+            self.hud.move_to_corner(animate=False)
+            self.hud.hide()
+            o = self.hud.opts["corner"]
+            self.hud_reveal.play(self.hud, o, (0.72, 0.72), k=300.0, c=11.0)
+        else:
+            self.pop_scope.close_menu()
+            self.hud_reveal.finish()
+            self.hud.hide()
+        self.canvas.update()
+
+    def _update_strip(self):
+        entries = []
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.isHidden():
+                continue
+            path = item.data(Qt.ItemDataRole.UserRole)
+            icon = item.icon()
+            pix = icon.pixmap(QSize(160, 120)) if not icon.isNull() else None
+            entries.append((path, pix, item.checkState() == Qt.CheckState.Checked, path == self.current))
+        self.rail.set_entries(entries)
+        k = len(self._checked_paths())
+        self.strip_batch.setVisible(k > 0)
+        self.lbl_strip_ticked.setText(f"{k} ticked")
+        self.rail.setFixedWidth(max(56, min(self.rail.content_width(), max(56, self.width() - 760))))
+        self.rail.ensure_current_visible()
+
+    # ------------------------------------------------------------ menus
+    def _anchor_below(self, widget, right=False):
+        g = widget.mapTo(self, QPoint(0, 0))
+        grp = widget.parentWidget()
+        y = grp.mapTo(self, QPoint(0, grp.height())).y() + 6 if grp is not None else g.y() + widget.height() + 6
+        x = g.x() + (widget.width() if right else 0)
+        if grp is not None and isinstance(grp, GlassPanel):
+            gx = grp.mapTo(self, QPoint(0, 0)).x()
+            x = gx + grp.width() if right else gx
+        return QPoint(x, y)
+
+    def _open_quality_menu(self, *_):
+        if self.pop_quality.is_open():
+            self.pop_quality.close_menu()
+            return
+        self.btn_quality.setChecked(True)
+        self.pop_quality.open_at(self._anchor_below(self.btn_quality), "tl")
+
+    def _open_proof_menu(self, *_):
+        if self.pop_proof.is_open():
+            self.pop_proof.close_menu()
+            return
+        self._sync_proof_controls()
+        self.btn_proof_menu.setChecked(True)
+        self.pop_proof.open_at(self._anchor_below(self.btn_proof_menu, right=True), "tr")
+
+    def _open_defaults_menu(self, *_):
+        if self.pop_defaults.is_open():
+            self.pop_defaults.close_menu()
+            return
+        self.lbl_def_summary.setText(self._defaults_summary())
+        self.btn_defaults.setChecked(True)
+        g = self.btn_defaults.mapTo(self, QPoint(self.btn_defaults.width() + 6, self.btn_defaults.height() + 13))
+        self.pop_defaults.open_at(g, "tr")
+
+    def _open_appearance_menu(self, *_):
+        if self.pop_appearance.is_open():
+            self.pop_appearance.close_menu()
+            return
+        for key, s in self.app_sliders.items():
+            s.set_value(APPEARANCE[key])
+        for key, s in self.app_switches.items():
+            s.switch.blockSignals(True)
+            s.setChecked(bool(APPEARANCE[key]))
+            s.switch.blockSignals(False)
+        for b in self.accent_buttons:
+            b.update()
+        self.pop_appearance.open_at(self._anchor_below(self.btn_app), "tl")
+
+    def _open_scope_menu(self):
+        if self.pop_scope.is_open():
+            self.pop_scope.close_menu()
+            return
+        o = self.hud.opts
+        self._loading = True
+        try:
+            self.sl_scope_size.set_value(o["size"])
+            self.sl_scope_gain.set_value(o["gain"])
+            self.seg_scope_ch.set_key(o["channels"], animate=False)
+            self.seg_scope_scale.set_key(o["scale"], animate=False)
+            self.seg_scope_bins.set_key(int(o["bins"]), animate=False)
+            self.sw_scope_clip.setChecked(o["clip"])
+            self.sw_scope_grat.setChecked(o["graticule"])
+            self.cmb_scope_type.setCurrentIndex(max(0, self.cmb_scope_type.findData(o["type"])))
+        finally:
+            self._loading = False
+        self._scope_rows()
+        self.pop_scope.open_at(*self._scope_menu_anchor())
+
+    def _scope_rows(self):
+        hist = self.hud.opts["type"] == "Histogram"
+        self.scope_hist_rows.setVisible(hist)
+        self.scope_other_rows.setVisible(not hist)
+
+    def _scope_option(self, **kw):
+        if self._loading:
+            return
+        self.hud.set_options(**kw)
+        if "type" in kw:
+            self._scope_rows()
+        self._save_scope()
+        if self.pop_scope.is_open():             # the menu stays beside the scope as it resizes
+            self.pop_scope.move_to(*self._scope_menu_anchor())
+        self.canvas.update()
+
+    def _scope_menu_anchor(self):
+        """Where the scope menu hangs: under the scope (above it in a bottom corner),
+        from where the scope is heading rather than where it is mid-spring."""
+        corner = self.hud.opts["corner"]
+        pos = self._hud_pos(corner)
+        bw, bh = self.hud.body_size()
+        x = pos.x() + ScopeHud.M + (0 if corner[1] == "l" else bw)
+        y = pos.y() + ScopeHud.M + (bh + 6 if corner[0] == "t" else -6)
+        return QPoint(int(x), int(y)), ("t" if corner[0] == "t" else "b") + corner[1]
+
+    def _reset_scope(self, *_):
+        corner = self.hud.opts["corner"]
+        self.hud.opts = dict(SCOPE_DEFAULTS, corner=corner)
+        self.hud.set_options()
+        self.pop_scope.close_menu()
+        self._save_scope()
+
+    def _save_scope(self):
+        self.settings.setValue("scope_v21", json.dumps(self.hud.opts))
+
+    def _set_appearance(self, **kw):
+        if self._loading:
+            return
+        old_accent = APPEARANCE["accent"]
+        old_frame = APPEARANCE["native_frame"]
+        APPEARANCE.update(kw)
+        APPEARANCE_VERSION[0] += 1
+        self._save_appearance()
+        if APPEARANCE["accent"] != old_accent:
+            QApplication.instance().setStyleSheet(build_stylesheet())
+            QApplication.instance().setPalette(dark_palette())
+        if APPEARANCE["native_frame"] != old_frame:
+            QTimer.singleShot(0, self._apply_frame)
+        self.canvas._ambient_cache = None
+        self.canvas._invalidate()
+        self._layout(animate=True)
+        for b in self.accent_buttons:
+            b.update()
+        self.update()
+        self.pop_appearance.refresh_backdrop()
+
+    def _apply_frame(self):
+        self.pop_appearance.close_menu()
+        self.frameless = not APPEARANCE["native_frame"]
+        geo = self.geometry()
+        flags = Qt.WindowType.Window
+        if self.frameless:
+            flags |= Qt.WindowType.FramelessWindowHint
+        self.setWindowFlags(flags)
+        for b in (self.btn_min, self.btn_max, self.btn_close):
+            b.setVisible(self.frameless)
+        self.show()
+        self.setGeometry(geo)
+        self._layout(animate=False)
+
+    def _reset_appearance(self, *_):
+        native = APPEARANCE["native_frame"]
+        values = dict(APPEARANCE_DEFAULTS)
+        values["native_frame"] = native
+        self._set_appearance(**values)
+        self._open_appearance_menu()
+        self._open_appearance_menu()
+
     # ------------------------------------------------------------ library
     def _add_files(self, *_):
         paths, _filter = QFileDialog.getOpenFileNames(
@@ -7321,22 +11027,17 @@ class MainWindow(QWidget):
         files = find_raw_files(paths, recursive=self.sw_subfolders.isChecked())
         new = [p for p in files if p not in self.entries]
         if not files:
-            QMessageBox.information(self, "No raw files",
-                                    "No .SRF files were found there." +
-                                    ("" if self.sw_subfolders.isChecked()
-                                     else "\n\nTurn on 'Include subfolders' to look deeper."))
+            self._message("No .SRF files were found there." +
+                          ("" if self.sw_subfolders.isChecked() else " Turn on 'Include subfolders' to look deeper."))
             return 0
         first = None
         for p in new:
-            self.entries[p] = Entry(p)
-            self.entries[p].edit.render, self.entries[p].edit.sony_curve = self._render_default()
-            self.entries[p].edit.demosaic = self._demosaic_default()
+            self.entries[p] = Entry(p, self._new_edit())
             item = QListWidgetItem(os.path.basename(p))
             item.setData(Qt.ItemDataRole.UserRole, p)
             item.setToolTip(p)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
-            item.setSizeHint(QSize(200, 68))
             self.items[p] = item
             self.list.addItem(item)
             if first is None:
@@ -7347,12 +11048,15 @@ class MainWindow(QWidget):
         self._update_counts()
         if first is not None and self.current is None:
             self.list.setCurrentItem(first)
+        self._layout()
         return len(new)
 
     def _apply_filter(self, *_):
         needle = self.edit_filter.text().strip().lower()
         for path, item in self.items.items():
             item.setHidden(bool(needle) and needle not in os.path.basename(path).lower())
+        if self._strip_on():
+            self._layout()
 
     def _checked_paths(self):
         out = []
@@ -7368,10 +11072,13 @@ class MainWindow(QWidget):
             if not item.isHidden():
                 item.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
         self.list.blockSignals(False)
+        self.list.viewport().update()
         self._update_counts()
 
     def _remove_selected(self, *_):
         paths = [item.data(Qt.ItemDataRole.UserRole) for item in self.list.selectedItems()]
+        if not paths and self.current:
+            paths = [self.current]
         if not paths:
             return
         closing_current = self.current in paths
@@ -7389,33 +11096,50 @@ class MainWindow(QWidget):
             row = max(0, self.list.currentRow())
             self.list.setCurrentRow(-1)
             self.list.setCurrentRow(min(row, self.list.count() - 1))
+        self._layout()
 
     def _update_counts(self, *_):
         n, k = len(self.entries), len(self._checked_paths())
-        self.lbl_count.setText(f"{n} image{'s' if n != 1 else ''}   \u00B7   {k} ticked" if n else
-                               "Nothing here yet")
-        self.lbl_batch.setText(f"Batch: {k} image{'s' if k != 1 else ''} ticked" if k else
-                               "Batch: tick images in the library to export or sync several at once")
+        self.lbl_count.setText(f"{n} image{'s' if n != 1 else ''}" if n else "")
+        self.lbl_ticked.setText(f"{k} ticked")
+        self.batch_row.setVisible(k > 0)
+        self.lbl_empty_lib.setVisible(n == 0)
+        self.list.setVisible(n > 0)
         self.btn_export_checked.setEnabled(k > 0 and self._export_thread is None)
+        self.btn_strip_export.setEnabled(k > 0 and self._export_thread is None)
         self.btn_sync.setEnabled(self.sensor is not None and k > 0)
+        self.btn_strip_sync.setEnabled(self.sensor is not None and k > 0)
+        if self._strip_on():
+            self._layout()
 
     def _queue_thumb(self, path):
         """Ask the thumbnail thread for this image's thumbnail (camera preview
         for untouched images, a real develop once it has edits)."""
         entry = self.entries.get(path)
         if entry is not None:
-            self.thumb_worker.submit(make_thumbnail, path, entry.edit.copy(), not entry.edited)
+            self.thumb_worker.submit(make_thumbnail, path, self._effective(entry, resolve=False, before=False),
+                                     not entry.edited)
 
     def _thumb_done(self, result):
         item = self.items.get(result["path"])
         if item is not None and result["thumb"] is not None and result["path"] != self.current:
             item.setIcon(QIcon(array_to_pixmap(result["thumb"])))
+            if self.strip.isVisible():
+                self._update_strip()
 
     def _update_current_thumb(self):
-        if self._shown is None or self.current not in self.items or self.view.tool == "crop":
+        if (self._shown is None or self.current not in self.items or self.canvas.tool == "crop" or self.before_on
+                or self._shown_proof is not None):
             return
         step = max(1, max(self._shown.shape[:2]) // 160)
         self.items[self.current].setIcon(QIcon(array_to_pixmap(self._shown[::step, ::step])))
+        if self.strip.isVisible():
+            self._update_strip()
+
+    def _open_from_strip(self, path):
+        item = self.items.get(path)
+        if item is not None:
+            self.list.setCurrentItem(item)
 
     # ------------------------------------------------------------ opening an image
     def _current_item_changed(self, item, _previous=None):
@@ -7426,6 +11150,7 @@ class MainWindow(QWidget):
             self._open(path)
 
     def _close_current(self):
+        self._flush_history()
         self._refine.stop()
         self._token += 1
         self._gen += 1
@@ -7433,18 +11158,16 @@ class MainWindow(QWidget):
         self.current, self.sensor, self.meta = None, None, None
         self._quarter, self._shown, self._shown_level, self._shown_proof = None, None, None, None
         self.preview_worker.submit(self.renderer.forget)        # let go of the old image's memory
-        self.edit = Edit()
-        self.view.clear()
-        self.viewer.set_status("")
-        self.histogram.set_image(None)
+        self.edit = self._eff = self._new_edit()
+        self.canvas.clear()
+        self.hud.set_image(None)
+        self.hud.hide()
+        self._load_controls()
+        for lbl in (self.lbl_black_info, self.lbl_asshot, self.lbl_render, self.lbl_crop, self.lbl_hot, self.lbl_ca):
+            lbl.setText("")
         self.lbl_info.setText("No image loaded")
-        self.lbl_black_info.setText("")
-        self.lbl_asshot.setText("")
-        self.lbl_render.setText("")
-        self.lbl_crop.setText("")
-        self.lbl_hot.setText("")
-        self.lbl_ca.setText("")
         self._update_enabled()
+        self._update_status()
         gc.collect()
 
     def _open(self, path):
@@ -7464,6 +11187,7 @@ class MainWindow(QWidget):
             self.list.blockSignals(False)
             return
         try:
+            self._flush_history()
             self._refine.stop()
             self._token += 1
             self.current, self.sensor, self.meta = path, sensor, meta
@@ -7471,59 +11195,69 @@ class MainWindow(QWidget):
             entry = self.entries[path]
             self.edit = entry.edit
             resolve_edit(self.edit, sensor, self._quarter_dn())
-            if self.view.tool == "crop":
+            if not entry.history:
+                entry.history = [(self.edit.copy(), frozenset(entry.off))]
+                entry.hpos = 0
+            if self.canvas.tool == "crop":
                 self._set_tool("pan", refresh=False)
             self._load_controls()
             self._update_info()
             self._update_enabled()
-            self.view.request_fit()
+            self.canvas.request_fit()
             self._request()
             self._update_current_thumb()
+            if self.strip.isVisible():
+                self._update_strip()
         finally:
             QApplication.restoreOverrideCursor()
             gc.collect()
 
     def _update_enabled(self):
         on = self.sensor is not None
-        v = self.viewer
-        for wdg in (self.btn_reset, self.cmb_wb, self.btn_auto_wb, self.sl_temp, self.sl_tint, self.sl_exp,
-                    self.sl_black, self.sw_rolloff, self.sw_highlights, self.sw_ir, self.cmb_black,
-                    self.sw_sony, self.cmb_sony_curve, self.cmb_demosaic, self.sw_hot, self.cmb_aspect,
+        for wdg in (self.btn_reset, self.cmb_wb, self.btn_auto_wb, self.btn_pick_wb, self.sl_temp, self.sl_tint,
+                    self.sl_exp, self.sl_black, self.sw_rolloff, self.sw_highlights, self.sw_ir, self.cmb_black,
+                    self.seg_colour, self.cmb_demosaic, self.sw_hot, self.cmb_aspect,
                     self.btn_auto_ca, self.sl_ca_red, self.sl_ca_blue, self.sl_defringe, self.sl_chroma_nr,
                     self.sl_straighten, self.btn_crop_tool, self.btn_reset_crop, self.btn_export,
-                    v.btn_pan, v.btn_crop, v.btn_pick, self.btn_cw, self.btn_ccw, self.btn_fliph, self.btn_flipv,
-                    v.btn_zoom_in, v.btn_zoom_out, v.btn_fit, v.btn_100, v.btn_clip):
+                    self.btn_pan, self.btn_crop, self.btn_pick, self.btn_cw, self.btn_ccw, self.btn_fliph,
+                    self.btn_flipv, self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_100, self.btn_clip,
+                    self.btn_before, self.sl_zoom):
             wdg.setEnabled(on)
+        for card in self.cards.values():
+            card.switch.setEnabled(on)
+            card.btn_reset.setEnabled(on)
         self.btn_export.setEnabled(on and self._export_thread is None)
         self.btn_sync.setEnabled(on and bool(self._checked_paths()))
         self._update_render_controls()
+        self._update_history_buttons()
 
     def _update_render_controls(self):
         """Controls that only mean something for one of the two renderings."""
         on = self.sensor is not None
         sony = on and self.edit.render == "sony"
-        self.cmb_sony_curve.setEnabled(sony and not self.edit.ir)
         self.sw_rolloff.setEnabled(on and not sony)       # Sony's curve has its own highlight shoulder
         if not on:
             self.lbl_render.setText("")
         elif self.edit.ir and sony:
             self.lbl_render.setText("IR false colour is on, so it is used instead of Sony colour.")
-        elif sony and self.sensor.get("camera") is not None:
-            self.lbl_render.setText("The camera's own colour processor, set up from this file's registers, "
-                                    "as Image Data Converter SR renders it. Full-size exports and their "
-                                    "export preview use IDC's own arithmetic, so they match its files. "
-                                    "Highlight roll-off is not used (the curve has its own).")
-        elif sony:
+        elif sony and self.sensor.get("camera") is None:
             self.lbl_render.setText("This file has no readable camera registers, so the approximate Sony "
                                     "rendering (matrix + tone curve) is used.")
+        elif sony:
+            mode = "Real" if self.edit.sony_curve == "real" else "Standard"
+            self.lbl_render.setText(f"The camera's {mode} mode: Sony colour and tone curve, matching Image "
+                                    "Data Converter.")
         else:
-            self.lbl_render.setText("Default rendering: Adobe-style colour matrix, sRGB curve.")
+            self.lbl_render.setText("Adobe-style colour matrix, sRGB curve and the highlight roll-off "
+                                    "(the default rendering of earlier versions).")
 
     def _load_controls(self):
         """Push the current image's edits into the controls without triggering re-renders."""
         e = self.edit
+        entry = self.entries.get(self.current)
         self._loading = True
         try:
+            self.seg_colour.set_key("adobe" if e.render != "sony" else e.sony_curve)
             self.cmb_wb.setCurrentIndex(max(0, self.cmb_wb.findData(e.wb_preset)))
             self.sl_temp.set_value(e.temp)
             self.sl_tint.set_value(e.tint)
@@ -7532,8 +11266,6 @@ class MainWindow(QWidget):
             self.sw_rolloff.setChecked(e.rolloff)
             self.sw_highlights.setChecked(e.highlights)
             self.sw_ir.setChecked(e.ir)
-            self.sw_sony.setChecked(e.render == "sony")
-            self.cmb_sony_curve.setCurrentIndex(max(0, self.cmb_sony_curve.findData(e.sony_curve)))
             self.cmb_demosaic.setCurrentIndex(max(0, self.cmb_demosaic.findData(e.demosaic)))
             self._update_demosaic_note()
             self.sw_hot.setChecked(e.hot_pixels)
@@ -7545,25 +11277,29 @@ class MainWindow(QWidget):
             self.sl_straighten.set_value(e.straighten)
             self.cmb_black.setCurrentIndex(max(0, self.cmb_black.findData(e.black_mode)))
             self.cmb_aspect.setCurrentIndex(0)
-            self.view.set_aspect(None)
+            self.canvas.set_aspect(None)
+            for key, card in self.cards.items():
+                card.set_on(entry is None or key not in entry.off)
         finally:
             self._loading = False
         self._update_render_controls()
         self._update_hot_info()
+        self._update_black_info()
+        self._update_cards()
 
     def _update_info(self):
         s = self.sensor
         if s is None:
             return
         h, w = s["cfa"].shape
-        rows = [("File", os.path.basename(self.current)), ("Sensor", f"{w} \u00D7 {h}  RGBE")]
+        rows = [("File", os.path.basename(self.current)), ("Sensor", f"{w} × {h}  RGBE")]
         rows += describe_metadata(self.meta or {})
         if not (self.meta or {}).get("exif"):
             rows.append(("EXIF", "none found in this file"))
         self.lbl_info.setText("\n".join(f"{k}:  {v}" for k, v in rows))
         tt = sensor_asshot(s)
         if tt and s.get("asshot_source") == "camera":
-            self.lbl_asshot.setText(f"Camera as-shot (from its registers): {tt[0]:.0f} K, tint {tt[1]:+.0f}")
+            self.lbl_asshot.setText(f"Camera as-shot: {tt[0]:.0f} K, tint {tt[1]:+.0f}")
         elif tt and s.get("asshot_source") == "preview":
             self.lbl_asshot.setText(f"Camera as-shot (from its preview): {tt[0]:.0f} K, tint {tt[1]:+.0f}")
         elif tt:
@@ -7588,6 +11324,234 @@ class MainWindow(QWidget):
         lines.append(f" white  {self.sensor['white']:6.0f}")
         self.lbl_black_info.setText("\n".join(lines))
 
+    # ------------------------------------------------------------ sections, defaults, history
+    def _effective(self, entry=None, resolve=True, before=True):
+        """The edit as it is rendered and exported: sections that are switched
+        off act as neutral, and Before shows the defaults (with this crop)."""
+        entry = entry or self.entries.get(self.current)
+        if entry is None:
+            return self.edit
+        e = entry.edit.copy()
+        off = entry.off
+        if before and self.before_on and entry.path == self.current:
+            d = self._new_edit()
+            for f in DEFAULT_FIELDS:
+                setattr(e, f, getattr(d, f))
+        if "colour" in off:
+            e.render = "default"
+        if "wb" in off:
+            e.wb_preset, e.temp, e.tint = "asshot", None, None
+        if "light" in off:
+            e.exposure, e.black_point, e.rolloff, e.highlights, e.ir = 0.0, 0, False, False, False
+        if "crop" in off:
+            e.rot_k, e.flip, e.straighten, e.crop = None, False, 0.0, (0.0, 0.0, 1.0, 1.0)
+        if "lens" in off:
+            e.ca_red, e.ca_blue, e.defringe = 0.0, 0.0, 0
+        if "noise" in off:
+            e.chroma_nr = 0
+        if "sensor" in off:
+            e.hot_pixels, e.black_mode = False, "camera"
+        if resolve and self.sensor is not None and entry.path == self.current:
+            resolve_edit(e, self.sensor, self._quarter_dn())
+        return e
+
+    def _section_dirty(self, key):
+        """Does this section differ from the defaults for new images?"""
+        if self.sensor is None:
+            return False
+        e, d = self.edit, self._new_edit()
+        if key == "crop":
+            return (e.rot_k != int(self.sensor.get("quarter_turns", 0)) or e.flip or abs(e.straighten) > 1e-6
+                    or tuple(e.crop) != (0.0, 0.0, 1.0, 1.0))
+        if key == "wb":
+            if e.wb_preset != d.wb_preset:
+                return True
+            return d.wb_preset == "custom" and (e.temp, e.tint) != (d.temp, d.tint)
+        if key == "colour" and e.render != "sony" and d.render != "sony":
+            return False
+        return any(getattr(e, f) != getattr(d, f) for f in SECTION_FIELDS.get(key, ()))
+
+    def _update_cards(self):
+        on = self.sensor is not None
+        e = self.edit
+        for key, card in self.cards.items():
+            card.set_dirty(self._section_dirty(key) if on else False)
+        if not on:
+            for card in self.cards.values():
+                card.set_summary("")
+            return
+        fw, fh = self._frame_size()
+        cw, ch = self._crop_size
+        aspect = self.cmb_aspect.currentText().split("  (")[0].replace(" : ", ":")
+        summaries = {
+            "colour": dict(COLOUR_MODES and [(k, l) for l, k in COLOUR_MODES]).get(
+                "adobe" if e.render != "sony" else e.sony_curve, ""),
+            "wb": f"{self.cmb_wb.currentText()} · {e.temp:.0f} K" if e.temp else self.cmb_wb.currentText(),
+            "light": f"{e.exposure:+.1f} EV" + (" · IR" if e.ir else ""),
+            "crop": f"{aspect} · {e.straighten:.1f}° · {cw} × {ch}",
+            "lens": ("Off" if not (abs(e.ca_red) >= 0.05 or abs(e.ca_blue) >= 0.05 or e.defringe) else
+                     " · ".join(x for x in (
+                         f"CA {e.ca_red:+.1f} / {e.ca_blue:+.1f}" if abs(e.ca_red) >= 0.05 or abs(e.ca_blue) >= 0.05
+                         else "", f"Defringe {e.defringe}" if e.defringe else "") if x)),
+            "noise": f"Colour {e.chroma_nr}" if e.chroma_nr else "Off",
+            "sensor": (self.cmb_demosaic.currentText().split(" (")[0].strip() + " · " +
+                       self.cmb_black.currentText().split(" (")[0].strip().split(":")[0] + " black"),
+            "info": os.path.basename(self.current or ""),
+        }
+        entry = self.entries.get(self.current)
+        for key, card in self.cards.items():
+            text = summaries.get(key, "")
+            if entry is not None and key in entry.off:
+                text = "Off"
+            card.set_summary(text)
+        del fw, fh
+
+    def _card_folded(self, key, on):
+        self.cards_open[key] = bool(on)
+        self.settings.setValue("cards_open_v21", json.dumps(self.cards_open))
+
+    def _section_switched(self, key, on):
+        entry = self.entries.get(self.current)
+        if entry is None:
+            return
+        if on:
+            entry.off.discard(key)
+        else:
+            entry.off.add(key)
+        self._changed()
+
+    def _reset_section(self, key):
+        if self.sensor is None:
+            return
+        e, d = self.edit, self._new_edit()
+        if key == "crop":
+            e.rot_k, e.flip, e.straighten, e.crop = None, False, 0.0, (0.0, 0.0, 1.0, 1.0)
+            if self.canvas.tool == "crop":
+                self._set_tool("pan", refresh=False)
+            self.canvas.request_fit()
+        elif key == "wb":
+            e.wb_preset, e.temp, e.tint = d.wb_preset, d.temp, d.tint
+        else:
+            for f in SECTION_FIELDS.get(key, ()):
+                setattr(e, f, getattr(d, f))
+        resolve_edit(e, self.sensor, self._quarter_dn())
+        entry = self.entries.get(self.current)
+        if entry is not None:
+            entry.off.discard(key)
+        self._load_controls()
+        self._changed()
+
+    def _defaults_summary(self):
+        d = self._defaults()
+        colour = "Adobe-style colour" if d["render"] != "sony" else (
+            "Sony Real" if d["sony_curve"] == "real" else "Sony Standard")
+        wb = dict((key, label) for label, key, _ in WB_PRESETS).get(d["wb_preset"], d["wb_preset"])
+        dem = dict((key, text.split("(")[0].strip()) for text, key in DEMOSAIC_MODES).get(d["demosaic"], d["demosaic"])
+        black = dict((key, text.split("(")[0].strip()) for text, key in BLACK_MODES).get(d["black_mode"], d["black_mode"])
+        base = Edit()
+        core = {"render", "sony_curve", "wb_preset", "demosaic", "black_mode", "rolloff", "temp", "tint"}
+        more = [k for k, v in self.user_defaults.items() if k not in core and v != getattr(base, k)]
+        if self.user_defaults.get("rolloff", False):
+            more.append("rolloff")
+        tail = f"{len(more)} more of your own" if more else "everything else off or neutral"
+        return (f"Now: {colour} · {wb} white balance · {dem} demosaic · {black} black level "
+                f"· {tail}")
+
+    def _save_defaults(self, *_):
+        if self.sensor is None:
+            self._message("Open an image first: its settings become the defaults.")
+            return
+        e = self.edit
+        d = {f: getattr(e, f) for f in DEFAULT_FIELDS}
+        if e.wb_preset != "custom":
+            d["temp"] = d["tint"] = None
+        self.user_defaults = clean_defaults(d)
+        self.settings.setValue("develop_defaults_v21", json.dumps(self.user_defaults))
+        self.lbl_def_summary.setText(self._defaults_summary())
+        self._update_cards()
+        self._message("Saved: new images start with these settings.")
+
+    def _restore_builtin_defaults(self, *_):
+        self.user_defaults = {}
+        self.settings.remove("develop_defaults_v21")
+        self.lbl_def_summary.setText(self._defaults_summary())
+        self._update_cards()
+        self._message("New images start with the built-in defaults again.")
+
+    def _changed(self, rerender=True):
+        """Any edit of the open image: mark it, schedule an undo step, refresh."""
+        if self.sensor is None:
+            return
+        entry = self.entries.get(self.current)
+        if entry is not None:
+            entry.edited = True
+        if self.before_on:
+            self.btn_before.blockSignals(True)
+            self.btn_before.setChecked(False)
+            self.btn_before.blockSignals(False)
+            self.before_on = False
+        self._history_timer.start()
+        self._update_cards()
+        if rerender:
+            self._request()
+
+    def _flush_history(self):
+        if self._history_timer.isActive():
+            self._history_timer.stop()
+            self._commit_history()
+
+    def _commit_history(self):
+        entry = self.entries.get(self.current)
+        if entry is None:
+            return
+        snap = (entry.edit.copy(), frozenset(entry.off))
+        if 0 <= entry.hpos < len(entry.history) and entry.history[entry.hpos][0] == snap[0] \
+                and entry.history[entry.hpos][1] == snap[1]:
+            return
+        del entry.history[entry.hpos + 1:]
+        entry.history.append(snap)
+        if len(entry.history) > 200:
+            del entry.history[0]
+        entry.hpos = len(entry.history) - 1
+        self._update_history_buttons()
+
+    def _update_history_buttons(self):
+        entry = self.entries.get(self.current)
+        pending = self._history_timer.isActive()
+        self.btn_undo.setEnabled(entry is not None and (entry.hpos > 0 or pending))
+        self.btn_redo.setEnabled(entry is not None and entry.hpos < len(entry.history) - 1 and not pending)
+
+    def _undo(self, *_):
+        entry = self.entries.get(self.current)
+        if entry is None:
+            return
+        self._flush_history()
+        if entry.hpos > 0:
+            entry.hpos -= 1
+            self._apply_snapshot(entry, entry.history[entry.hpos])
+
+    def _redo(self, *_):
+        entry = self.entries.get(self.current)
+        if entry is None:
+            return
+        self._flush_history()
+        if entry.hpos < len(entry.history) - 1:
+            entry.hpos += 1
+            self._apply_snapshot(entry, entry.history[entry.hpos])
+
+    def _apply_snapshot(self, entry, snap):
+        geometry = (self.edit.rot_k, self.edit.flip, self.edit.straighten, tuple(self.edit.crop))
+        entry.edit = self.edit = snap[0].copy()
+        entry.off = set(snap[1])
+        entry.edited = True
+        if self.canvas.tool == "crop":
+            self._set_tool("pan", refresh=False)
+        self._load_controls()
+        if geometry != (self.edit.rot_k, self.edit.flip, self.edit.straighten, tuple(self.edit.crop)):
+            self.canvas.request_fit()
+        self._update_history_buttons()
+        self._request()
+
     # ------------------------------------------------------------ rendering
     def _quarter_dn(self):
         """The 25% frame. Cheap, so it stays on this thread: drafts, auto white
@@ -7596,22 +11560,25 @@ class MainWindow(QWidget):
             self._quarter = sensor_rgbe_dn(self.sensor, "quarter")
         return self._quarter
 
-    def _frame_size(self):
+    def _frame_size(self, e=None):
+        e = e or self._eff
         h, w = self.sensor["cfa"].shape
-        return oriented_size(w, h, self.edit.rot_k)
+        rot = e.rot_k if e.rot_k is not None else int(self.sensor.get("quarter_turns", 0))
+        return oriented_size(w, h, rot)
 
     def _view_options(self):
-        return {"cropping": self.view.tool == "crop", "clip": self.viewer.btn_clip.isChecked()}
+        return {"cropping": self.canvas.tool == "crop", "clip": self.btn_clip.isChecked()}
 
     def _proof_options(self):
         """The export settings when the picture should be shown as the export file, else None."""
-        if not self.viewer.sw_proof.isChecked() or self.export_opts.fmt == "dng" or self.view.tool == "crop":
+        if not self.btn_proof.isChecked() or self.export_opts.fmt == "dng" or self.canvas.tool == "crop" \
+                or self.before_on:
             return None
         return self.export_opts.copy()
 
-    def _needs_full_frame(self):
+    def _needs_full_frame(self, e=None):
         """Edits that the quick 25% superpixel frame cannot show."""
-        e = self.edit
+        e = e or self._eff
         return e.hot_pixels or abs(e.ca_red) >= 1e-3 or abs(e.ca_blue) >= 1e-3
 
     def _request(self, *_):
@@ -7620,13 +11587,14 @@ class MainWindow(QWidget):
         for the real thing; the window never waits for it."""
         if self.sensor is None:
             return
+        self._eff = self._effective()
         proof = self._proof_options()
         final = self.preview_level == "quarter" and proof is None and not self._needs_full_frame()
-        if final or self.viewer.sw_draft.isChecked() or self._shown is None:
-            base = develop_preview(self._quarter_dn(), self.sensor, self.edit, parallel=False)
-            draft = compose_view(base, self.edit, self._frame_size(), **self._view_options())
+        if final or self.draft_on or self._shown is None:
+            base = develop_preview(self._quarter_dn(), self.sensor, self._eff, parallel=False)
+            draft = compose_view(base, self._eff, self._frame_size(), **self._view_options())
             if proof is not None:            # keep the zoom in export pixels while the draft shows
-                _level, ow, oh = proof_level(self.edit, self._frame_size(), proof)
+                _level, ow, oh = proof_level(self._eff, self._frame_size(), proof)
                 draft["frame"] = (ow, oh)
             self._display(draft, "quarter")
         self._request_proof(final)
@@ -7651,9 +11619,9 @@ class MainWindow(QWidget):
             self._update_status()
             self._update_current_thumb()
             return
-        job = {"gen": self._gen, "token": self._token, "sensor": self.sensor, "edit": self.edit.copy(),
+        job = {"gen": self._gen, "token": self._token, "sensor": self.sensor, "edit": self._eff.copy(),
                "level": self.preview_level, "frame": self._frame_size(), "options": self._view_options(),
-               "proof": proof, "proof_view": self.viewer.cmb_proof_view.currentData()}
+               "proof": proof, "proof_view": self.cmb_proof_view.currentData()}
         self.preview_worker.submit(self.renderer.render, job)
 
     def _preview_done(self, result):
@@ -7667,48 +11635,84 @@ class MainWindow(QWidget):
     def _preview_failed(self, text):
         sys.stderr.write(text)
         self._waiting = False
-        self.viewer.set_status("The preview could not be rendered: " + text.strip().splitlines()[-1])
+        self._update_status()
+        self._message("The preview could not be rendered: " + text.strip().splitlines()[-1], timeout=8000)
 
     def _display(self, r, level):
         if r["cropping"]:
-            self.view.set_crop(r["crop"])
+            self.canvas.set_crop(r["crop"])
         img, frame = r["img"], r["frame"]
         self._shown_proof = r.get("proof")
         if self._shown_proof is not None:
             self._show_proof_result(self._shown_proof)
         self._shown, self._shown_level, self._crop_size = img, level, r["crop_size"]
-        self.histogram.set_image(img)
-        self.view.set_image(r["view"], frame[0], frame[1])
+        if self.hud.isVisible():
+            self.hud.set_image(img)
+        elif self.hud.opts.get("visible", True):
+            self._set_scope_visible(True)
+        self.canvas.set_image(r["view"], frame[0], frame[1])
         cw, ch = r["crop_size"]
-        self.lbl_crop.setText(f"Output: {cw} \u00D7 {ch} px" + ("   Double-click inside the frame, or "
+        self.lbl_crop.setText(f"Output: {cw} × {ch} px" + ("   Double-click inside the frame, or "
                               "press 'Done cropping', to apply." if r["cropping"] else ""))
         self._update_status()
+        self._update_cards()
 
     def _update_status(self):
-        if self.sensor is None or self._shown_level is None:
+        """The file name, size and state in the top bar."""
+        if self.sensor is None:
+            self.lbl_file.setText("No image")
+            self.lbl_dims.setText("")
+            self.lbl_flag.setText("")
+            self.lbl_dims.hide()
+            return
+        name = os.path.basename(self.current)
+        self.lbl_file.setText(name)
+        self.lbl_file.setMinimumWidth(int(QFontMetricsF(self.lbl_file.font()).horizontalAdvance(name)) + 2)
+        if self._shown_level is None:
             return
         fw, fh = self._frame_size()
         cw, ch = self._crop_size
-        size = f"{fw} \u00D7 {fh}" if (cw, ch) == (fw, fh) else f"{fw} \u00D7 {fh}  \u2192  crop {cw} \u00D7 {ch}"
-        name = os.path.basename(self.current)
+        dims = f"{fw} × {fh}" if (cw, ch) == (fw, fh) else f"{fw} × {fh}  →  {cw} × {ch}"
         proof = self._shown_proof
-        if proof is not None:
-            ow, oh = proof["size"]
-            text = (f"{name}   \u00B7   export preview: {EXPORT_FORMATS[proof['fmt']][0].split('  (')[0]}, "
-                    f"{ow} \u00D7 {oh} px")
-        else:
-            text = f"{name}   \u00B7   {size}   \u00B7   preview {int(RESOLUTION_SCALE[self._shown_level] * 100)}%"
+        if proof is None and self._shown_level != "full" and not self._waiting:
+            dims += f"   ·   preview {int(RESOLUTION_SCALE[self._shown_level] * 100)}%"
+        self.lbl_dims.setText(dims)
+        self.lbl_dims.setVisible(self.width() >= 1150)
+        flags = []
+        if self.before_on:
+            flags.append("Before")
+        if proof is not None:                    # the full details are in the export preview menu
+            text = "As exported · " + EXPORT_FORMATS[proof['fmt']][0].split('  (')[0]
+            if proof["bytes"] is not None:
+                text += f" · {human_size(proof['bytes'])}"
+            flags.append(text)
         if self._waiting:
-            text += ("   \u00B7   rendering the export\u2026" if self._proof_options() is not None else
-                     f"   \u00B7   rendering {int(RESOLUTION_SCALE[self.preview_level] * 100)}%\u2026")
-        self.viewer.set_status(text)
+            flags.append("Rendering…")
+        self.lbl_flag.setText("   ·   ".join(flags))
 
-    def _edit_changed(self):
-        """A develop setting changed."""
-        if self.sensor is None:
+    def _message(self, text, timeout=4000):
+        self.toast.show_message(text, timeout=timeout)
+
+    def _zoom_changed(self, z):
+        self.lbl_zoom.setText(f"{z:.0f}%")
+        fit = self.canvas.fit_percent()
+        self.btn_fit.setChecked(self.canvas.is_fit())
+        self.btn_100.setChecked(abs(z - 100.0) < 0.5)
+        if not self.sl_zoom.isSliderDown():
+            top = 1600.0
+            f = 0.0 if fit >= top else math.log(max(z, fit) / fit) / math.log(top / fit)
+            self.sl_zoom.blockSignals(True)
+            self.sl_zoom.setValue(int(round(min(max(f, 0.0), 1.0) * self.sl_zoom.maximum())), animate=True)
+            self.sl_zoom.blockSignals(False)
+
+    def _zoom_slider_moved(self, pos):
+        fit = self.canvas.fit_percent()
+        top = 1600.0
+        if fit >= top:
             return
-        self.entries[self.current].edited = True
-        self._request()
+        f = pos / float(self.sl_zoom.maximum())
+        z = fit * (top / fit) ** f
+        self.canvas.set_zoom(z / 100.0)
 
     # ------------------------------------------------------------ develop controls
     def _busy(self):
@@ -7733,7 +11737,7 @@ class MainWindow(QWidget):
             self.sl_tint.set_value(e.tint)
         finally:
             self._loading = False
-        self._edit_changed()
+        self._changed()
 
     def _temp_tint_changed(self, *_):
         if self._busy():
@@ -7745,7 +11749,7 @@ class MainWindow(QWidget):
             self.cmb_wb.setCurrentIndex(max(0, self.cmb_wb.findData("custom")))
         finally:
             self._loading = False
-        self._edit_changed()
+        self._changed()
 
     def _tone_changed(self, *_):
         if self._busy():
@@ -7757,37 +11761,25 @@ class MainWindow(QWidget):
         e.highlights = self.sw_highlights.isChecked()
         e.ir = self.sw_ir.isChecked()
         self._update_render_controls()
-        self._edit_changed()
-
-    def _render_default(self):
-        """(render, sony_curve) for newly added images: the last choice made."""
-        render = str(self.settings.value("render", "default") or "default")
-        curve = str(self.settings.value("sony_curve", "real") or "real")
-        return (render if render in ("default", "sony") else "default",
-                curve if curve in _SONY_CURVE_Y else "real")
+        self._changed()
 
     def _render_changed(self, *_):
         if self._busy():
             return
         e = self.edit
-        e.render = "sony" if self.sw_sony.isChecked() else "default"
-        e.sony_curve = self.cmb_sony_curve.currentData() or "real"
-        self.settings.setValue("render", e.render)           # new images start with this choice
-        self.settings.setValue("sony_curve", e.sony_curve)
+        key = self.seg_colour.key()
+        if key == "adobe":
+            e.render = "default"
+        else:
+            e.render, e.sony_curve = "sony", key
         self._update_render_controls()
         if e.wb_preset in IDC_WB_PRESETS:                   # Sony colour uses IDC's own preset gains
             self._apply_wb_preset(e.wb_preset)
             return
-        self._edit_changed()
-
-    def _demosaic_default(self):
-        """The demosaic for newly added images: the last choice made."""
-        keys = [self.cmb_demosaic.itemData(i) for i in range(self.cmb_demosaic.count())]
-        key = str(self.settings.value("demosaic", keys[0]) or keys[0])
-        return key if key in keys else keys[0]
+        self._changed()
 
     def _update_demosaic_note(self):
-        key = self.cmb_demosaic.currentData() or "idc"
+        key = self.cmb_demosaic.currentData() or "guided"
         self.lbl_demosaic.setText(DEMOSAIC_NOTES.get(key, "") + " Used by every preview size and by "
                                   "full-size exports; half-size exports bin 2x2 pixels instead.")
 
@@ -7796,23 +11788,24 @@ class MainWindow(QWidget):
         if self._busy():
             return
         self.edit.demosaic = self.cmb_demosaic.currentData() or "guided"
-        self.settings.setValue("demosaic", self.edit.demosaic)    # new images start with this choice
-        self._edit_changed()
+        self._changed()
 
     def _hot_changed(self, *_):
         if self._busy():
             return
         self.edit.hot_pixels = self.sw_hot.isChecked()
         self._update_hot_info()
-        self._edit_changed()
+        self._changed()
 
     def _update_hot_info(self):
         if self.sensor is None or not self.edit.hot_pixels:
             self.lbl_hot.setText("")
+            self.lbl_hot.setVisible(False)
             return
+        self.lbl_hot.setVisible(True)
         n = self.sensor.get("hot_pixels_found")
         if n is None:
-            self.lbl_hot.setText("Looking for hot pixels\u2026")
+            self.lbl_hot.setText("Looking for hot pixels…")
         elif n == 0:
             self.lbl_hot.setText("No hot or dead pixels found in this picture.")
         else:
@@ -7824,7 +11817,7 @@ class MainWindow(QWidget):
         self.edit.ca_red = round(self.sl_ca_red.value(), 2)
         self.edit.ca_blue = round(self.sl_ca_blue.value(), 2)
         self.lbl_ca.setText("")
-        self._edit_changed()
+        self._changed()
 
     def _auto_ca(self, *_):
         if self.sensor is None:
@@ -7848,27 +11841,27 @@ class MainWindow(QWidget):
             self._loading = False
         self.lbl_ca.setText(f"Measured in this picture: red {e.ca_red:+.1f}, blue {e.ca_blue:+.1f}. It "
                             "changes with the zoom, so measure each focal length.")
-        self._edit_changed()
+        self._changed()
 
     def _detail_changed(self, *_):
         if self._busy():
             return
         self.edit.defringe = int(round(self.sl_defringe.value()))
         self.edit.chroma_nr = int(round(self.sl_chroma_nr.value()))
-        self._edit_changed()
+        self._changed()
 
     def _black_mode_changed(self, *_):
         if self._busy():
             return
         self.edit.black_mode = self.cmb_black.currentData()
         self._update_black_info()
-        self._edit_changed()
+        self._changed()
 
     def _picked(self, u, v):
         """White-balance picker: (u, v) are fractions of the picture as displayed."""
         if self.sensor is None:
             return
-        e = self.edit
+        e = self._eff
         dn = self._quarter_dn()
         rgbe = apply_orientation(
             normalise_rgbe(dn, black_for(self.sensor, e.black_mode), self.sensor["white"]), e.rot_k, e.flip)
@@ -7880,50 +11873,65 @@ class MainWindow(QWidget):
         patch = rgbe[max(0, r - 3):r + 4, max(0, c - 3):c + 4]
         tt = picked_white_balance(patch) if patch.size else None
         if tt is None:
-            self.viewer.set_status("That spot is clipped or too dark to measure. Try a mid-grey area.")
+            self._message("That spot is clipped or too dark to measure. Try a mid-grey area.")
             return
+        e = self.edit
         e.temp, e.tint, e.wb_preset = tt[0], tt[1], "custom"
+        entry = self.entries.get(self.current)
+        if entry is not None:
+            entry.off.discard("wb")
         self._loading = True
         try:
             self.cmb_wb.setCurrentIndex(max(0, self.cmb_wb.findData("custom")))
             self.sl_temp.set_value(e.temp)
             self.sl_tint.set_value(e.tint)
+            self.cards["wb"].set_on(True)
         finally:
             self._loading = False
-        self._edit_changed()
+        self._changed()
 
     def _reset_edits(self, *_):
         if self.sensor is None:
             return
         entry = self.entries[self.current]
-        keep = Edit(render=self.edit.render, sony_curve=self.edit.sony_curve,     # the rendering and
-                    demosaic=self.edit.demosaic)                                   # demosaic choices stay
-        entry.edit = self.edit = resolve_edit(keep, self.sensor, self._quarter_dn())
-        if self.view.tool == "crop":
+        entry.edit = self.edit = resolve_edit(self._new_edit(), self.sensor, self._quarter_dn())
+        entry.off = set()
+        if self.canvas.tool == "crop":
             self._set_tool("pan", refresh=False)
         self._load_controls()
-        self._update_black_info()
-        self.view.request_fit()
+        self.canvas.request_fit()
+        self._changed()
+
+    def _before_toggled(self, on):
+        self.before_on = bool(on)
         self._request()
 
     # ------------------------------------------------------------ geometry
     def _set_tool(self, tool, refresh=True):
-        v = self.viewer
         if self.sensor is None:
             tool = "pan"
-        was = self.view.tool
-        self.view.set_tool(tool)
-        {"pan": v.btn_pan, "crop": v.btn_crop, "pick": v.btn_pick}[tool].setChecked(True)
+        was = self.canvas.tool
+        entry = self.entries.get(self.current)
+        if tool == "crop" and entry is not None and "crop" in entry.off:
+            entry.off.discard("crop")
+            self.cards["crop"].set_on(True)
+        self.canvas.set_tool(tool)
+        for name, b in (("pan", self.btn_pan), ("crop", self.btn_crop), ("pick", self.btn_pick)):
+            b.setChecked(name == tool)
+        self.btn_pick_wb.setChecked(tool == "pick")
         self.btn_crop_tool.setChecked(tool == "crop")
         self.btn_crop_tool.setText("Done cropping" if tool == "crop" else "Edit crop")
+        if tool == "crop" and not self.cards["crop"].is_open():
+            self.cards["crop"].set_open(True)
         if self.sensor is None or not refresh:
             return
         if (was == "crop") != (tool == "crop"):
             if was == "crop":
                 self._crop_finished()
                 self.entries[self.current].edited = True
+                self._changed(rerender=False)
             self._sync_proof_controls()
-            self.view.request_fit()
+            self.canvas.request_fit()
             self._request()
 
     def _orient(self, what):
@@ -7938,36 +11946,34 @@ class MainWindow(QWidget):
         try:
             self.sl_straighten.set_value(e.straighten)
             self.cmb_aspect.setCurrentIndex(0)
-            self.view.set_aspect(None)
+            self.canvas.set_aspect(None)
         finally:
             self._loading = False
-        self.entries[self.current].edited = True
-        self.view.request_fit()
-        self._request()
+        self.canvas.request_fit()
+        self._changed()
 
     def _straighten_changed(self, *_):
         if self._busy():
             return
         self.edit.straighten = round(self.sl_straighten.value(), 2)
-        self.entries[self.current].edited = True
-        self._request()
+        self._changed()
 
     def _aspect_changed(self, *_):
         if self._busy():
             return
         value = self.cmb_aspect.currentData()
-        fw, fh = self._frame_size()
+        fw, fh = self._frame_size(self.edit)
         if value is None:
-            self.view.set_aspect(None)
+            self.canvas.set_aspect(None)
             return
         ratio = fw / float(fh) if value == "original" else float(value)
-        self.view.set_aspect(fw / (ratio * fh))
+        self.canvas.set_aspect(fw / (ratio * fh))
         self.edit.crop = fit_aspect(effective_crop(self.edit.crop, self.edit.straighten, fw, fh), ratio, fw, fh)
-        self.entries[self.current].edited = True
-        if self.view.tool != "crop":
+        if self.canvas.tool != "crop":
             self._set_tool("crop")
+            self._changed(rerender=False)
         else:
-            self._request()
+            self._changed()
 
     def _crop_dragged(self, rect):
         if self.sensor is None:
@@ -7975,15 +11981,16 @@ class MainWindow(QWidget):
         self.edit.crop = tuple(rect)
         fw, fh = self._frame_size()
         cw, ch = round((rect[2] - rect[0]) * fw), round((rect[3] - rect[1]) * fh)
-        self.lbl_crop.setText(f"Output: {cw} \u00D7 {ch} px")
+        self.lbl_crop.setText(f"Output: {cw} × {ch} px")
 
     def _crop_finished(self):
         if self.sensor is None:
             return
-        fw, fh = self._frame_size()
+        fw, fh = self._frame_size(self.edit)
         self.edit.crop = effective_crop(self.edit.crop, self.edit.straighten, fw, fh)
-        self.view.set_crop(self.edit.crop)
+        self.canvas.set_crop(self.edit.crop)
         self.entries[self.current].edited = True
+        self._changed(rerender=False)
 
     def _reset_crop(self, *_):
         if self.sensor is None:
@@ -7994,63 +12001,69 @@ class MainWindow(QWidget):
         try:
             self.sl_straighten.set_value(0.0)
             self.cmb_aspect.setCurrentIndex(0)
-            self.view.set_aspect(None)
+            self.canvas.set_aspect(None)
         finally:
             self._loading = False
-        self.view.request_fit()
-        self._request()
+        self.canvas.request_fit()
+        self._changed()
 
     # ------------------------------------------------------------ preview quality
-    def _preview_level_changed(self, *_):
-        v = self.viewer
-        key, label, _scale = RESOLUTIONS[int(v.sl_res.value())]
-        v.lbl_res.setText(label)
-        if key != self.preview_level:
+    def _update_res_note(self):
+        self.lbl_res.setText(dict((k, label) for k, label, _s in RESOLUTIONS)[self.preview_level])
+
+    def _preview_level_changed(self, key):
+        if key and key != self.preview_level:
             self.preview_level = key
+            self.settings.setValue("preview_level_v21", key)
+            self._update_res_note()
             self._request()
 
+    def _draft_toggled(self, on):
+        self.draft_on = bool(on)
+        self.settings.setValue("draft_v21", "true" if on else "false")
+
     def _full_quality(self, *_):
-        v = self.viewer
-        v.sw_draft.setChecked(False)
-        v.sw_proof.setChecked(False)
-        v.sl_res.setValue(len(RESOLUTIONS) - 1)
-        self._preview_level_changed()
+        self.sw_draft.setChecked(False)
+        self.btn_proof.setChecked(False)
+        self.seg_res.set_key("full", emit=True)
+        self.pop_quality.close_menu()
 
     def _sync_proof_controls(self):
-        """Show the current export settings in the export preview panel."""
-        v, o = self.viewer, self.export_opts
+        """Show the current export settings in the export preview menu."""
+        o = self.export_opts
         self._loading_proof = True
         try:
-            v.cmb_proof_fmt.clear()
+            self.cmb_proof_fmt.clear()
             for key in available_formats():
-                v.cmb_proof_fmt.addItem(EXPORT_FORMATS[key][0].split("  (")[0], key)
-            v.cmb_proof_fmt.setCurrentIndex(max(0, v.cmb_proof_fmt.findData(o.fmt)))
+                self.cmb_proof_fmt.addItem(EXPORT_FORMATS[key][0].split("  (")[0], key)
+            self.cmb_proof_fmt.setCurrentIndex(max(0, self.cmb_proof_fmt.findData(o.fmt)))
             field = QUALITY_FIELD.get(o.fmt)
             if field:
                 lo, hi = QUALITY_RANGE.get(o.fmt, (1, 100))
-                v.sl_proof_q.set_range(lo, hi, " dB" if o.fmt == "jp2" else "")
-                v.sl_proof_q.set_value(getattr(o, field))
-            v.sl_proof_q.setEnabled(bool(field) and format_lossy(o))
-            v.lbl_proof_opts.setText(export_summary(o))
+                self.sl_proof_q.set_range(lo, hi, " dB" if o.fmt == "jp2" else "")
+                self.sl_proof_q.set_value(getattr(o, field))
+            self.sl_proof_q.setVisible(bool(field) and format_lossy(o))
+            self.lbl_proof_opts.setText(export_summary(o))
         finally:
             self._loading_proof = False
-        on = v.sw_proof.isChecked()
-        v.cmb_proof_view.setEnabled(on and format_lossy(o) and o.fmt != "dng")
+        on = self.btn_proof.isChecked()
+        self.cmb_proof_view.setEnabled(on and format_lossy(o) and o.fmt != "dng")
         if not on:
-            v.lbl_proof.setText("")
+            self.lbl_proof.setText("Turn on Export preview to see the picture as this file will hold it.")
         elif o.fmt == "dng":
-            v.lbl_proof.setText("A DNG stays raw: Lightroom or another raw converter develops it, so the "
-                                "picture shown is this app's own rendering.")
-        elif self.view.tool == "crop":
-            v.lbl_proof.setText("The export preview comes back when you finish cropping.")
+            self.lbl_proof.setText("A DNG stays raw: Lightroom or another raw converter develops it, so the "
+                                   "picture shown is this app's own rendering.")
+        elif self.canvas.tool == "crop":
+            self.lbl_proof.setText("The export preview comes back when you finish cropping.")
+        elif self._shown_proof is not None:
+            self._show_proof_result(self._shown_proof)
 
     def _show_proof_result(self, p):
         """What the export preview found: the file's size, and anything to know about it."""
-        v = self.viewer
         w, h = p["size"]
-        lines = [f"{w} \u00D7 {h} px"]
+        lines = [f"{w} × {h} px"]
         if p["bytes"] is not None:
-            lines[0] += f"   \u00B7   about {human_size(p['bytes'])}"
+            lines[0] += f"   ·   about {human_size(p['bytes'])}"
             if p["quality"] is not None:
                 lines.append(f"Quality {p['quality']}{' dB' if p['fmt'] == 'jp2' else ''} is the highest "
                              f"that fits {p['target_kb']} KB.")
@@ -8059,13 +12072,13 @@ class MainWindow(QWidget):
         if p["out_of_gamut"] >= 0.001:
             lines.append(f"{p['out_of_gamut'] * 100:.1f}% of the picture has colours outside "
                          f"{COLOR_SPACES[p['space']]['label']} (magenta with Clipping on).")
-        v.lbl_proof.setText("\n".join(lines))
+        self.lbl_proof.setText("\n".join(lines))
 
     def _proof_toggled(self, *_):
         self._sync_proof_controls()
-        if not self.viewer.sw_proof.isChecked():
+        if not self.btn_proof.isChecked():
             self._shown_proof = None
-        self.view.request_fit()
+        self.canvas.request_fit()
         self._request()
 
     def _export_options_changed(self):
@@ -8077,10 +12090,10 @@ class MainWindow(QWidget):
     def _proof_format_changed(self, *_):
         if self._loading_proof:
             return
-        fmt = self.viewer.cmb_proof_fmt.currentData()
+        fmt = self.cmb_proof_fmt.currentData()
         if fmt and fmt != self.export_opts.fmt:
             self.export_opts.fmt = fmt
-            self.view.request_fit()
+            self.canvas.request_fit()
             self._export_options_changed()
 
     def _proof_quality_changed(self, *_):
@@ -8088,18 +12101,20 @@ class MainWindow(QWidget):
             return
         field = QUALITY_FIELD.get(self.export_opts.fmt)
         if field:
-            setattr(self.export_opts, field, int(round(self.viewer.sl_proof_q.value())))
+            setattr(self.export_opts, field, int(round(self.sl_proof_q.value())))
             self._export_options_changed()
 
     def _export_settings(self, *_):
         """The full export settings, without exporting (the export preview follows them)."""
+        self.pop_proof.close_menu()
         estimate = None
         if self.sensor is not None:
-            estimate = lambda o: estimate_export_size(self.sensor, self.edit, o, self.meta)  # noqa: E731
+            eff = self._effective(before=False)
+            estimate = lambda o: estimate_export_size(self.sensor, eff, o, self.meta)  # noqa: E731
         dlg = ExportDialog(self, self.export_opts, "Export settings", estimate, settings_only=True)
         if dlg.exec():
             self.export_opts = dlg.options()
-            self.view.request_fit()
+            self.canvas.request_fit()
             self._export_options_changed()
 
     # ------------------------------------------------------------ batch: sync + export
@@ -8108,7 +12123,7 @@ class MainWindow(QWidget):
             return
         targets = [p for p in self._checked_paths() if p != self.current]
         if not targets:
-            QMessageBox.information(self, "Sync edits", "Tick the other images you want to copy these edits to.")
+            self._message("Tick the other images you want to copy these edits to.")
             return
         dlg = SyncDialog(self, len(targets))
         if not dlg.exec():
@@ -8116,24 +12131,25 @@ class MainWindow(QWidget):
         groups = dlg.groups()
         if not groups:
             return
+        source = self._effective(resolve=False, before=False)
         for p in targets:
             entry = self.entries[p]
-            entry.edit = sync_edit(self.edit, entry.edit, groups)
+            entry.edit = sync_edit(source, entry.edit, groups)
             entry.edited = True
             self._queue_thumb(p)
-        self.viewer.set_status(f"Edits copied to {len(targets)} image{'s' if len(targets) != 1 else ''}")
+        self._message(f"Edits copied to {len(targets)} image{'s' if len(targets) != 1 else ''}.")
 
     def _export(self, ticked):
         paths = self._checked_paths() if ticked else ([self.current] if self.current else [])
         if not paths:
-            QMessageBox.information(self, "Export", "Tick some images in the library first." if ticked
-                                    else "Open an image first.")
+            self._message("Tick some images in the library first." if ticked else "Open an image first.")
             return
         heading = (f"Export {len(paths)} ticked image{'s' if len(paths) != 1 else ''}" if ticked
                    else f"Export {os.path.basename(paths[0])}")
         estimate = None
         if self.sensor is not None:
-            estimate = lambda o: estimate_export_size(self.sensor, self.edit, o, self.meta)  # noqa: E731
+            eff = self._effective(before=False)
+            estimate = lambda o: estimate_export_size(self.sensor, eff, o, self.meta)  # noqa: E731
         dlg = ExportDialog(self, self.export_opts, heading, estimate)
         if not dlg.exec():
             return
@@ -8142,9 +12158,9 @@ class MainWindow(QWidget):
         self._run_export(paths, self.export_opts)
 
     def _run_export(self, paths, opts):
-        """Start the export on its own thread; the progress window only reports."""
+        """Start the export on its own thread; a small card near the bottom reports it."""
         if self._export_thread is not None:
-            QMessageBox.information(self, "Export", "An export is already running.")
+            self._message("An export is already running.")
             return
         if opts.out_dir:
             try:
@@ -8155,62 +12171,53 @@ class MainWindow(QWidget):
         jobs = []
         for path in paths:                       # snapshot the edits: later changes do not affect this run
             current = path == self.current and self.sensor is not None
-            jobs.append((path, self.entries[path].edit.copy(), self.sensor if current else None,
+            edit = self._effective(self.entries[path], resolve=False, before=False)
+            jobs.append((path, edit, self.sensor if current else None,
                          self.meta if current and opts.copy_metadata else None))
-        progress = QProgressDialog("Preparing\u2026", "Cancel", 0, len(jobs), self)
-        progress.setWindowTitle("Exporting")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
         thread = ExportThread(jobs, opts, self)
         thread.progress.connect(self._export_progress)
         thread.finished_all.connect(self._export_finished)
-        progress.canceled.connect(thread.cancel)
-        self._export_thread, self._export_dialog = thread, progress
+        self._export_thread = thread
         self._update_enabled()
         self._update_counts()
-        progress.setValue(0)
-        progress.show()
+        self.toast.show_message(f"Preparing to export {len(jobs)} image{'s' if len(jobs) != 1 else ''}…",
+                                [("Cancel", thread.cancel)], timeout=0, progress=0.0)
         thread.start()
 
     def _export_progress(self, index, name):
-        dialog = self._export_dialog
-        if dialog is None or dialog.wasCanceled():
+        thread = self._export_thread
+        if thread is None:
             return
-        dialog.setValue(index)
-        dialog.setLabelText(f"Exporting {index + 1} of {dialog.maximum()}\n{name}")
+        self.toast.set_progress(index / float(max(1, thread.total)),
+                                f"Exporting {index + 1} of {thread.total}   ·   {name}")
 
     def _export_finished(self, done, errors):
-        thread, dialog = self._export_thread, self._export_dialog
+        thread = self._export_thread
         total = thread.total if thread is not None else len(done) + len(errors)
-        self._export_thread = self._export_dialog = None
+        self._export_thread = None
         if thread is not None:
             thread.wait(5000)
             thread.deleteLater()
-        if dialog is not None:
-            dialog.close()
-            dialog.deleteLater()
         self._update_enabled()
         self._update_counts()
-
-        box = QMessageBox(self)
-        box.setWindowTitle("Export finished")
-        text = f"Exported {len(done)} of {total} image{'s' if total != 1 else ''}."
+        text = f"Exported {len(done)} of {total} image{'s' if total != 1 else ''}"
+        buttons = []
         if done:
-            text += f"\n\n{os.path.dirname(done[-1])}"
+            folder = os.path.dirname(done[-1])
+            buttons.append(("Open folder", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(folder))))
         if errors:
-            box.setIcon(QMessageBox.Icon.Warning)
-            text += f"\n\n{len(errors)} failed; see the details."
-            box.setDetailedText("\n".join(errors))
-        else:
-            box.setIcon(QMessageBox.Icon.Information)
-        box.setText(text)
-        open_button = box.addButton("Open folder", QMessageBox.ButtonRole.ActionRole) if done else None
-        box.addButton(QMessageBox.StandardButton.Ok)
-        box.exec()
-        if open_button is not None and box.clickedButton() == open_button:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(done[-1])))
+            text += f"   ·   {len(errors)} failed"
+
+            def details():
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("Export problems")
+                box.setText(f"{len(errors)} image{'s' if len(errors) != 1 else ''} could not be exported.")
+                box.setDetailedText("\n".join(errors))
+                box.exec()
+            buttons.append(("Details", details))
+        buttons.append(("OK", self.toast.dismiss))
+        self.toast.show_message(text, buttons, timeout=0 if errors else 12000)
 
     # ------------------------------------------------------------ closing
     def stop_threads(self):
@@ -8224,6 +12231,10 @@ class MainWindow(QWidget):
                 worker.shutdown()
 
     def closeEvent(self, event):
+        try:
+            self.settings.setValue("window_geometry_v21", self.saveGeometry())
+        except Exception:
+            pass
         self.hide()                              # disappear at once; a job in flight may need a moment to end
         self.stop_threads()
         super().closeEvent(event)
@@ -8238,6 +12249,34 @@ class MainWindow(QWidget):
         if paths:
             event.acceptProposedAction()
             self.add_paths(paths)
+
+
+class AccentSwatch(PressMixin, QAbstractButton):
+    """A round colour choice in the Appearance menu."""
+
+    def __init__(self, colour):
+        super().__init__()
+        self.colour = colour
+        self.setFixedSize(22, 22)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setToolTip(colour)
+        self._init_press()
+        self.pressed.connect(lambda: self._press(True))
+        self.released.connect(lambda: self._press(False))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        self._apply_press(p, r)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self.colour))
+        p.drawEllipse(r.adjusted(2, 2, -2, -2))
+        if QColor(self.colour).name() == accent().name():
+            p.setPen(QPen(QColor("#ffffff"), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(r)
+        p.end()
 
 
 def _install_error_dialog():
@@ -8270,9 +12309,18 @@ def _install_error_dialog():
 
 
 def main():
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    settings = QSettings("F828Converter", "F828Converter")
+    try:
+        stored = json.loads(settings.value("appearance_v21", "") or "{}")
+        if isinstance(stored, dict) and QColor(str(stored.get("accent", ""))).isValid():
+            APPEARANCE["accent"] = str(stored["accent"])
+    except Exception:
+        pass
+    app.setFont(ui_font(13.0))
     app.setPalette(dark_palette())
     app.setStyleSheet(build_stylesheet())
     _install_error_dialog()
@@ -8280,10 +12328,12 @@ def main():
         threading.Thread(target=_warm_up_or_fall_back, name="numba-warm-up", daemon=True).start()
     window = MainWindow()
     screen = app.primaryScreen()
-    if screen is not None:               # never open larger than the screen
-        area = screen.availableGeometry()
+    if screen is not None and not settings.value("window_geometry_v21"):
+        area = screen.availableGeometry()             # never open larger than the screen
         window.resize(max(window.minimumWidth(), min(1500, area.width() - 40)),
                       max(window.minimumHeight(), min(930, area.height() - 60)))
+        window.move(area.x() + (area.width() - window.width()) // 2,
+                    area.y() + (area.height() - window.height()) // 2)
     window.show()
     app.aboutToQuit.connect(window.stop_threads)
     startup = [p for p in sys.argv[1:] if os.path.exists(p)]
